@@ -344,13 +344,24 @@ a scratch directory and are used only to produce the parity numbers quoted here.
 - "Sandbox" here means `env -i` (empty environment, fixed `PATH`, private `HOME`), `ulimit -f/-t`
   and a private working directory. This kernel (3.10) refuses unprivileged user namespaces, so
   `bwrap`/`unshare -m` are unavailable; treat it as contamination control, not a security boundary.
-- The invocation must mirror `riscv-target/riscvOVPsim/device/rv32i_m/I/Makefile.include`
-  (`--variant RV32I --program <elf> --signaturedump --customcontrol`, the five `sigdump` overrides,
-  `simulateexceptions=T`, `defaultsemihost=F`, `--logfile`, `user_version`, `priv_version`). Add
-  `--override riscvOVPsim/tracefile=<file> --override riscvOVPsim/cpu/trace=T` for an instruction
-  trace, and the `--startcover`/`--finishcover`/`--cover basic --extensions RVI --outputfile` group
-  for coverage.
-- The original's own diagnostic switches: `RUSTISS_TRACE=<file>` writes one `<pc:08x>` line per
+- The invocation must mirror `riscv-target/riscvOVPsim/device/rv32i_m/I/Makefile.include`:
+  `--variant RV32I --program <elf> --signaturedump --customcontrol`, the
+  `sigdump/SignatureFile` and `sigdump/SignatureGranularity` overrides,
+  `simulateexceptions=T`, `defaultsemihost=F`, `--logfile`, `user_version`, `priv_version`. The
+  sandbox adds `sigdump/SignatureDumpToStdout=F` so the signature does not also land on stdout.
+  Add `--override riscvOVPsim/tracefile=<file> --override riscvOVPsim/cpu/trace=T` for an
+  instruction trace, or `--startcover`/`--finishcover`/`--cover basic --extensions RVI
+  --outputfile <file>` for coverage.
+- Shape of a sandboxed run (`$SHIM` = the built shim, `$ORIG` = the original image, `$ELF` a test):
+
+  ```
+  env -i PATH=/usr/bin:/bin HOME=$PWD LD_PRELOAD=$SHIM FAKE_EPOCH=1685577600 \
+      bash -c 'ulimit -f 131072 -t 120; exec "$0" "${@:1}"' $ORIG --variant RV32I ...
+  ```
+
+  It prints `riscvOVPsim started: Thu Jun  1 08:00:00 2023`, and its signature output is
+  byte-identical to `references/<TEST>.reference_output` for all 48 tests.
+- The Rust ISS's diagnostic switches: `RUSTISS_TRACE=<file>` writes one `<pc:08x>` line per
   executed instruction, `RUSTISS_PCDUMP=<file>` writes per-PC disassembly plus coverage hits,
   `RUSTISS_COVDUMP=<file>` writes the covering tree in text-report shape.
 
