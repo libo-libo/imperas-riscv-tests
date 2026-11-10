@@ -1,0 +1,13 @@
+[package]
+name = "riscv-iss"
+version = "0.1.0"
+edition = "2021"
+description = "Rust reimplementation of riscvOVPsim.exe for the RISC-V architectural test suite"
+
+[[bin]]
+name = "riscvOVPsim"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+panic = "abort"
