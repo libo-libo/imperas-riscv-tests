@@ -11,6 +11,7 @@ pub struct Machine {
  pub finish_after:Option<u64>, pub finish_time:Option<f64>, pub sig_armed:bool,
  pub sig_lo:u64,pub sig_hi:u64,pub sig_writes:u64,pub cov:Option<Cov>,
  pub cov_lo:Option<u64>,pub cov_hi:Option<u64>,pub cov_on:bool,pub cov_counted:u64,
+ pub halt_pc:Option<u64>,
  pub hist:Option<std::collections::BTreeMap<u64,u64>>,pub trace:Option<std::fs::File>,
  pub addr_mask:u64,pub stop_pc:Option<u64>,pub stop_opcode:Option<u32>,pub stop_terminate:Option<u64>,
  pub ecall_reg:Option<usize>,pub ecall_pass:bool,pub exit:Exit,pub config:CpuConfig,
@@ -23,7 +24,7 @@ fn sext(v:u64,b:u32)->u64 { ((v << (64-b)) as i64 >> (64-b)) as u64 }
 impl Machine {
  pub fn new(mem:Memory,pc:u64,tohost:Option<u64>,config:CpuConfig)->Self {
  let misa=config.extensions | if config.xlen==32 {1<<30} else {2<<62}; let mtvec=config.mtvec;
- Self{custom_control:false,logfile:None,custom_exit_pc:None,x:[0;32],pc,mstatus:0,misa,mie:0,mtvec,mscratch:0,mepc:0,mcause:0,mtval:0,mip:0,counter:0,mem,tohost,instret:0,finish_after:None,finish_time:None,sig_armed:false,sig_lo:0,sig_hi:0,sig_writes:0,cov:None,cov_lo:None,cov_hi:None,cov_on:false,cov_counted:0,hist:std::env::var_os("RUSTISS_PCDUMP").map(|_|Default::default()),trace:std::env::var("RUSTISS_TRACE").ok().and_then(|p|std::fs::File::create(p).ok()),addr_mask:u64::MAX,stop_pc:None,stop_opcode:None,stop_terminate:None,ecall_reg:None,ecall_pass:false,exit:Exit::Running,config,semihost:None,privilege:3,medeleg:0,mideleg:0,stvec:0,sscratch:0,sepc:0,scause:0,stval:0,satp:0,mcounteren:0,scounteren:0,mcountinhibit:0,pmpcfg:[0;64],pmpaddr:[0;64],reservation:None}
+ Self{custom_control:false,logfile:None,custom_exit_pc:None,x:[0;32],pc,mstatus:0,misa,mie:0,mtvec,mscratch:0,mepc:0,mcause:0,mtval:0,mip:0,counter:0,mem,tohost,instret:0,finish_after:None,finish_time:None,sig_armed:false,sig_lo:0,sig_hi:0,sig_writes:0,cov:None,cov_lo:None,cov_hi:None,cov_on:false,cov_counted:0,halt_pc:None,hist:std::env::var_os("RUSTISS_PCDUMP").map(|_|Default::default()),trace:std::env::var("RUSTISS_TRACE").ok().and_then(|p|std::fs::File::create(p).ok()),addr_mask:u64::MAX,stop_pc:None,stop_opcode:None,stop_terminate:None,ecall_reg:None,ecall_pass:false,exit:Exit::Running,config,semihost:None,privilege:3,medeleg:0,mideleg:0,stvec:0,sscratch:0,sepc:0,scause:0,stval:0,satp:0,mcounteren:0,scounteren:0,mcountinhibit:0,pmpcfg:[0;64],pmpaddr:[0;64],reservation:None}
  }
  fn mask(&self,v:u64)->u64 {if self.config.xlen==32 {v as u32 as u64}else{v}}
  fn signed(&self,v:u64)->i64 {if self.config.xlen==32 {v as i32 as i64}else{v as i64}}
@@ -104,13 +105,29 @@ impl Machine {
  if self.stop_opcode==Some(ins){self.stop_simulation("opcode match");return Ok(())}
  if self.mcountinhibit&1==0{self.counter=self.counter.wrapping_add(1)}
  if let Some(h)=self.hist.as_mut(){*h.entry(self.pc).or_insert(0)+=1}if let Some(f)=self.trace.as_mut(){let _=std::io::Write::write_fmt(f,format_args!("{:08x}\n",self.pc));}
- if Some(self.pc)==self.cov_hi{self.cov_on=false}if Some(self.pc)==self.cov_lo{self.cov_on=true}
+ if Some(self.pc)==self.cov_lo{self.cov_on=true}let cov_at_hi=Some(self.pc)==self.cov_hi;
  let decoded=if len==2 {if self.ext(b'C'){self.decompress(ins as u16)}else{None}}else{Some(ins)};
  let cover=if self.cov_on&&self.cov.is_some(){decoded.and_then(|i|self.decode_cover(i)).and_then(|(name,operands)|if len==2{self.compressed_name(ins as u16).map(|name|(name,operands))}else{Some((name,operands))})}else{None};
+ // The original ends the run on entry to `write_tohost`: the signature dump is
+ // driven from that callback, so the function body never executes. The
+ // instruction is still counted, traced and attributed to coverage, using the
+ // register state it would have executed with.
+ if self.halt_pc==Some(self.pc){
+  if let Some((name,mut operands))=cover{operands.rd_val=self.would_write(ins).unwrap_or(self.x[operands.rd]);if let Some(c)=self.cov.as_mut(){if c.record_named(name,&operands){self.cov_counted+=1}}}
+  self.exit=Exit::Halt;return Ok(())
+ }
  let flow=if let Some(i)=decoded{self.exec(i,len)?}else{Flow::Trap(2,ins as u64)};
  match flow{Flow::Trap(c,v)=>self.take_trap(c,if c==2{ins as u64}else{v})?,Flow::Next=>{if self.mcountinhibit&4==0{self.instret=self.instret.wrapping_add(1)}}}
  if self.exit==Exit::Running {if let Some((name,mut operands))=cover{operands.rd_val=self.x[operands.rd];if let Some(c)=self.cov.as_mut(){if c.record_named(name,&operands){self.cov_counted+=1}}}}
+ // The instruction at the finish symbol is part of the window, exactly as the
+ // original model counts it; the window closes after it executes.
+ if cov_at_hi{self.cov_on=false}
  }}
+ /// The value a not-yet-executed instruction would write to `rd`. The original
+ /// attributes coverage for the instruction it stops on (`write_tohost` entry)
+ /// from that write, not from the register's previous contents; its prologue is
+ /// an `auipc`, whose result is available without executing anything.
+ fn would_write(&self,ins:u32)->Option<u64>{match ins&127{0x17=>Some(self.mask(self.pc.wrapping_add(sext((ins&0xfffff000)as u64,32)))),0x37=>Some(self.mask(sext((ins&0xfffff000)as u64,32))),_=>None}}
  fn stop_simulation(&mut self,reason:&'static str){println!("Info (EXC_FS) {reason}: Stopping at 0x{:x}",self.pc);self.exit=Exit::Stop(reason);if self.ecall_reg.is_some(){self.print_verdict()}}
  fn print_verdict(&self){println!("{}",if self.ecall_pass{"Test PASSED"}else{"Test FAILED"})}
  fn compressed_name(&self,h:u16)->Option<&'static str>{let c=h as u32;Some(match(c&3,c>>13){(0,0)=>"c.addi4spn",(0,2)=>"c.lw",(0,3)=>"c.ld",(0,6)=>"c.sw",(0,7)=>"c.sd",(1,0)=>if c&0xfffc==0{"c.nop"}else{"c.addi"},(1,1)=>if self.config.xlen==32{"c.jal"}else{"c.addiw"},(1,2)=>"c.li",(1,3)=>if (c>>7)&31==2{"c.addi16sp"}else{"c.lui"},(1,4)=>match(c>>10)&3{0=>"c.srli",1=>"c.srai",2=>"c.andi",_=>if c&0x1000==0{["c.sub","c.xor","c.or","c.and"][((c>>5)&3)as usize]}else{["c.subw","c.addw"][((c>>5)&1)as usize]}},(1,5)=>"c.j",(1,6)=>"c.beqz",(1,7)=>"c.bnez",(2,0)=>"c.slli",(2,2)=>"c.lwsp",(2,3)=>"c.ldsp",(2,4)=>if c&0x1000==0{if c&0x7c==0{"c.jr"}else{"c.mv"}}else if c&0x7c==0{if c&0xf80==0{"c.ebreak"}else{"c.jalr"}}else{"c.add"},(2,6)=>"c.swsp",(2,7)=>"c.sdsp",_=>return None})}

@@ -16,6 +16,11 @@ See the ChangeLog.md files in the simulator directories for their changes.
   unsupported ISA/coverage models.
 - Preserve the RV32I architectural-test result: the full 48-test run and basic coverage report
   remain byte-identical after the expanded implementation.
+- Match the licensed binary's stop rule: the run ends on entry to `write_tohost` (the halted
+  instruction is counted and attributed to coverage but never executed), the finish-symbol
+  instruction stays inside the coverage window, and coverage YAML carries the `---`/`...` document
+  markers. Differential against the original: 48/48 signature, PC trace, instruction count and
+  per-test coverage YAML identity.
 
 ---
 Date 2023-June-26

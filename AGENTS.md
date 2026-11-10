@@ -293,8 +293,10 @@ VA `0x3b5f0`, no file offset), and the merged report reproduces the upstream art
   operand shape (`rd/gpr/a0`, `cross/rs1_rs2/c00`, `offset/sign/zero`, ...), counting at the leaves.
   Each instruction node also carries a hidden `asm_count` child: how often that mnemonic executed
   inside the window. `asm_count` is a real node, so it is written to and read from the YAML too.
-- Window: arm on `--startcover`, disarm on `--finishcover`; the terminating store to `tohost` in
-  `write_tohost()` ends the run and is **not** counted.
+- Window: arm on `--startcover`, disarm on `--finishcover`, and the instruction at the finish
+  symbol is **inside** the window (the model closes it after that instruction executes, so the
+  `fence` at `rvtest_code_end` is counted). The run then ends on entry to `write_tohost`; that
+  instruction is counted and attributed to coverage even though its body never executes.
 - Report line shapes are `reportCoverage` @ `0x155b10`, `reportNode` @ `0x1555b0` and `missedNode`
   @ `0x155970`, not a formatting choice: node headers are `"%s%-15s\n"` with 4 spaces per depth, a
   leaf is `"%s%-10s %3u/%u : %6.2f%%%s"` where the trailing string is `" ZERO"` exactly when the
@@ -322,7 +324,55 @@ VA `0x3b5f0`, no file offset), and the merged report reproduces the upstream art
 - Guard rails: an unknown YAML key is reported as `YAML content '<path>/<key>' not recognised.`;
   a path that is neither file nor directory as `<path> is not a file or a directory`.
 - YAML round-trip is stable: merging the merged document reproduces both it and the report
-  (`diff` clean), so the writer and reader agree on `asm_count` and the zero-count leaves.
+  (`diff` clean), so the writer and reader agree on `asm_count` and the zero-count leaves. Emitted
+  documents carry the libyaml document markers (`---` first line, `...` last line) so a per-test
+  file is byte-identical to the original's.
+
+### Differential against the original binary (local only)
+
+The two artifacts needed to run the licensed binary are **not** in this repository: the original
+image (`*.imperas-orig`, excluded by `.gitignore`) and the clock shim described below. They live in
+a scratch directory and are used only to produce the parity numbers quoted here.
+
+- The bundled binary aborts with `license expired on 22 Oct 2023`. Its license check reads wall
+  clock time through `time`/`gettimeofday`/`ftime`, so an `LD_PRELOAD` shim that **shifts** the
+  realtime clock (`realtime - offset`, offset chosen so `now == FAKE_EPOCH`, default `1685577600` =
+  2023-06-01Z) keeps it running: it then reports `riscvOVPsim started: Thu Jun  1 08:00:00 2023`.
+  Shift, never freeze — a frozen clock makes the model wait forever (observed 61 s hang).
+- The shim must **not** intercept `clock_gettime`: adding it makes the original die with `SIGSEGV`
+  immediately after printing the program headers.
+- "Sandbox" here means `env -i` (empty environment, fixed `PATH`, private `HOME`), `ulimit -f/-t`
+  and a private working directory. This kernel (3.10) refuses unprivileged user namespaces, so
+  `bwrap`/`unshare -m` are unavailable; treat it as contamination control, not a security boundary.
+- The invocation must mirror `riscv-target/riscvOVPsim/device/rv32i_m/I/Makefile.include`
+  (`--variant RV32I --program <elf> --signaturedump --customcontrol`, the five `sigdump` overrides,
+  `simulateexceptions=T`, `defaultsemihost=F`, `--logfile`, `user_version`, `priv_version`). Add
+  `--override riscvOVPsim/tracefile=<file> --override riscvOVPsim/cpu/trace=T` for an instruction
+  trace, and the `--startcover`/`--finishcover`/`--cover basic --extensions RVI --outputfile` group
+  for coverage.
+- The original's own diagnostic switches: `RUSTISS_TRACE=<file>` writes one `<pc:08x>` line per
+  executed instruction, `RUSTISS_PCDUMP=<file>` writes per-PC disassembly plus coverage hits,
+  `RUSTISS_COVDUMP=<file>` writes the covering tree in text-report shape.
+
+Measured original versus Rust, all 48 `rv32i_m/I` tests:
+
+|Observation|Result|
+|---|---|
+|signature files|48/48 byte-identical (and 48/48 to `references/`)|
+|executed PC sequences (`--tracefile` vs `RUSTISS_TRACE`)|48/48 identical|
+|`Simulated instructions` vs the Rust log line|48/48 identical|
+|per-test coverage YAML|48/48 byte-identical|
+|merged `basic.coverage.txt`|byte-identical to the reference artifact|
+
+Not compared: the `--logfile` transcript itself, which carries a start timestamp and a
+host-dependent program/environment banner; two rules were derived from this differential rather
+than from disassembly:
+
+- The run ends on **entry** to `write_tohost` (its callback drives `SignatureAtEnd`), so the
+  function body never executes. The halted instruction is still counted, traced, and attributed to
+  coverage: the `auipc` there scores its `rd/gpr/t0` point, and its sign leaf uses the value that
+  `auipc` *would* have written, not the register's previous contents.
+- The finish-symbol instruction is inside the coverage window.
 
 ### Control options (the `exitControl` intercept model)
 

@@ -791,6 +791,7 @@ fn run(o: &Opts) -> Result<(), String> {
     };
 
     let mut m = Machine::new(mem, entry, tohost,config);
+    m.halt_pc = symbol(&image, "write_tohost");
     m.custom_control=o.custom_control;
     if o.custom_control{m.custom_exit_pc=symbol(&image,"_test_exit").map(|a|a.wrapping_add(1));if let Some(path)=&o.custom_logfile{m.logfile=Some(std::fs::File::create(path).map_err(|e|format!("cannot create customControl logfile '{path}': {e}"))?);}}
     m.finish_after = o.finish_after;
@@ -948,7 +949,7 @@ fn run(o: &Opts) -> Result<(), String> {
     match &result {
         Ok(()) => {
             let how = match m.exit {
-                Exit::Halt => "halt (write to tohost)".to_string(),
+                Exit::Halt => "halt (call to write_tohost)".to_string(),
                 Exit::Stop(reason) => format!("stop ({reason})"),
                 Exit::Terminate => "stop (terminate symbol)".to_string(),
                 Exit::Ecall => "stop (ecall result register)".to_string(),
@@ -960,7 +961,7 @@ fn run(o: &Opts) -> Result<(), String> {
             let _ = writeln!(log, "exit              : ERROR: {e}");
         }
     }
-    let _ = writeln!(log, "instructions      : {}", m.instret);
+    let _ = writeln!(log, "instructions      : {}", m.counter);
     let _ = writeln!(log, "wall time         : {:.3}s", elapsed.as_secs_f64());
 
     // The signature is generated when the simulation ends, as SignatureAtEnd

@@ -356,6 +356,9 @@ impl Cov {
             }
         }
         let mut out = String::new();
+        // libyaml frames the accumulator as one document: an explicit start
+        // marker here and an end marker after the last mapping.
+        out.push_str("---\n");
         for (idx, i) in self.ordered() {
             if !self.visible(idx) {
                 continue;
@@ -366,6 +369,7 @@ impl Cov {
                 node(k, 1, &mut out);
             }
         }
+        out.push_str("...\n");
         out
     }
 
