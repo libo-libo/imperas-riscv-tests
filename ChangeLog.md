@@ -6,6 +6,17 @@ This CHANGELOG contains information for the Imperas RISC-V test framework and te
 
 See the ChangeLog.md files in the simulator directories for their changes. 
 
+## Local Rust ISS updates
+
+- Expand the Rust ISS to ELF32/ELF64 RV32/RV64 I/E/M/A/C execution with M/S/U privilege state,
+  Sv32/Sv39/Sv48 translation, PMP, sparse permissioned memory, multi-object loading and loader
+  address controls.
+- Add semihost process setup and guest-checked syscall handling, customControl custom0 output and
+  `_test_exit`, simulation-time limits, signature-at-end control, and explicit rejection of
+  unsupported ISA/coverage models.
+- Preserve the RV32I architectural-test result: the full 48-test run and basic coverage report
+  remain byte-identical after the expanded implementation.
+
 ---
 Date 2023-June-26
 Release 20230626.0 
