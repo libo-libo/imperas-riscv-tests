@@ -7,11 +7,15 @@ pub struct Memory {
     pages: BTreeMap<u64, Box<[u8; PAGE]>>,
     regions: Vec<Region>,
     mask: u64,
+    /// Word indices touched by `write`, for observers that keep a second copy of
+    /// this address space (the DPI lane mirrors into the simulator's RAM). `None`
+    /// on the normal path, where nothing reads it and every store would pay for it.
+    pub mirror: Option<Vec<u64>>,
 }
 impl Memory {
     pub fn new(bits: u32) -> Self {
         let mask = if bits >= 64 { u64::MAX } else if bits == 0 { 0 } else { (1u64 << bits) - 1 };
-        Self { pages: BTreeMap::new(), regions: Vec::new(), mask }
+        Self { pages: BTreeMap::new(), regions: Vec::new(), mask, mirror: None }
     }
     pub fn configure(&mut self, specification: &str) -> Result<(), String> {
         fn number(s: &str) -> Result<u64, String> {
@@ -75,7 +79,11 @@ impl Memory {
     pub fn write(&mut self, addr: u64, n: u32, value: u64) -> bool {
         if n == 0 || n > 8 || !self.allowed(addr,n as u64,2) { return false; }
         let addr = addr & self.mask;
-        for i in 0..n { self.put(addr+i as u64,(value >> (i*8)) as u8); }
+        for i in 0..n {
+            let a = addr+i as u64;
+            self.put(a,(value >> (i*8)) as u8);
+            if let Some(m) = self.mirror.as_mut() { m.push(a >> 2); }
+        }
         true
     }
     /// Loader writes bypass region permissions, but never wrap the address space.

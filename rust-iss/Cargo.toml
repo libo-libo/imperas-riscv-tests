@@ -8,6 +8,14 @@ description = "Rust reimplementation of riscvOVPsim.exe for the RISC-V architect
 name = "riscvOVPsim"
 path = "src/main.rs"
 
+# DPI-C model for the CV32E40P step-and-compare testbench; loaded by VCS through
+# `-sv_lib`. It is a second entry point into the same interpreter, not a library
+# of the binary, so it gets its own crate root.
+[lib]
+name = "cv32dpi"
+path = "src/dpi.rs"
+crate-type = ["cdylib"]
+
 [profile.release]
 opt-level = 3
 panic = "abort"

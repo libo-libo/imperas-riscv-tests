@@ -17,14 +17,22 @@ pub struct Machine {
  pub ecall_reg:Option<usize>,pub ecall_pass:bool,pub exit:Exit,pub config:CpuConfig,
  pub semihost:Option<Semihost>,pub privilege:u8,
  pub custom_control:bool, pub logfile:Option<std::fs::File>, pub custom_exit_pc:Option<u64>,
+ // Read-only identification CSRs. The bundled model reports zero; a real core
+ // reports its own values, and firmware reads them back into registers, so
+ // they must be settable per target.
+ pub mvendorid:u64, pub marchid:u64,
  medeleg:u64,mideleg:u64,stvec:u64,sscratch:u64,sepc:u64,scause:u64,stval:u64,satp:u64,
- mcounteren:u64,scounteren:u64,mcountinhibit:u64,pmpcfg:[u8;64],pmpaddr:[u64;64],reservation:Option<(u64,u32)>,
+ mcounteren:u64,scounteren:u64,pub mcountinhibit:u64,pmpcfg:[u8;64],pmpaddr:[u64;64],reservation:Option<(u64,u32)>,
 }
 fn sext(v:u64,b:u32)->u64 { ((v << (64-b)) as i64 >> (64-b)) as u64 }
+
+/// One step of the DPI lane: what was fetched, how wide it was, and whether the
+/// instruction retired (`Flow::Next`) or trapped (`Flow::Trap`).
+pub struct StepReport { pub pc:u64, pub insn:u32, pub len:u64, pub flow:Flow }
 impl Machine {
  pub fn new(mem:Memory,pc:u64,tohost:Option<u64>,config:CpuConfig)->Self {
  let misa=config.extensions | if config.xlen==32 {1<<30} else {2<<62}; let mtvec=config.mtvec;
- Self{custom_control:false,logfile:None,custom_exit_pc:None,x:[0;32],pc,mstatus:0,misa,mie:0,mtvec,mscratch:0,mepc:0,mcause:0,mtval:0,mip:0,counter:0,mem,tohost,instret:0,finish_after:None,finish_time:None,sig_armed:false,sig_lo:0,sig_hi:0,sig_writes:0,cov:None,cov_lo:None,cov_hi:None,cov_on:false,cov_counted:0,halt_pc:None,hist:std::env::var_os("RUSTISS_PCDUMP").map(|_|Default::default()),trace:std::env::var("RUSTISS_TRACE").ok().and_then(|p|std::fs::File::create(p).ok()),addr_mask:u64::MAX,stop_pc:None,stop_opcode:None,stop_terminate:None,ecall_reg:None,ecall_pass:false,exit:Exit::Running,config,semihost:None,privilege:3,medeleg:0,mideleg:0,stvec:0,sscratch:0,sepc:0,scause:0,stval:0,satp:0,mcounteren:0,scounteren:0,mcountinhibit:0,pmpcfg:[0;64],pmpaddr:[0;64],reservation:None}
+ Self{custom_control:false,logfile:None,custom_exit_pc:None,mvendorid:0,marchid:0,x:[0;32],pc,mstatus:0,misa,mie:0,mtvec,mscratch:0,mepc:0,mcause:0,mtval:0,mip:0,counter:0,mem,tohost,instret:0,finish_after:None,finish_time:None,sig_armed:false,sig_lo:0,sig_hi:0,sig_writes:0,cov:None,cov_lo:None,cov_hi:None,cov_on:false,cov_counted:0,halt_pc:None,hist:std::env::var_os("RUSTISS_PCDUMP").map(|_|Default::default()),trace:std::env::var("RUSTISS_TRACE").ok().and_then(|p|std::fs::File::create(p).ok()),addr_mask:u64::MAX,stop_pc:None,stop_opcode:None,stop_terminate:None,ecall_reg:None,ecall_pass:false,exit:Exit::Running,config,semihost:None,privilege:3,medeleg:0,mideleg:0,stvec:0,sscratch:0,sepc:0,scause:0,stval:0,satp:0,mcounteren:0,scounteren:0,mcountinhibit:0,pmpcfg:[0;64],pmpaddr:[0;64],reservation:None}
  }
  fn mask(&self,v:u64)->u64 {if self.config.xlen==32 {v as u32 as u64}else{v}}
  fn signed(&self,v:u64)->i64 {if self.config.xlen==32 {v as i32 as i64}else{v as i64}}
@@ -72,13 +80,13 @@ impl Machine {
  self.reservation=None;if self.sig_armed&&a<=self.sig_hi&&a.saturating_add(n as u64-1)>=self.sig_lo{self.sig_writes+=1}if Some(a)==self.tohost{self.exit=Exit::Halt}Ok(())
  }
  fn time_ticks(&self)->u64 {(self.counter as f64*self.config.mtime_hz/(self.config.mips*1_000_000.0))as u64}
- fn csr_read(&self,a:u32)->Option<u64>{
+ pub fn csr_read(&self,a:u32)->Option<u64>{
  if matches!(a,0xc00|0xc80)&&self.config.cycle_undefined || matches!(a,0xb00|0xb80)&&self.config.mcycle_undefined || matches!(a,0xc01|0xc81)&&self.config.time_undefined || matches!(a,0xc02|0xc82)&&self.config.instret_undefined || matches!(a,0xb02|0xb82)&&self.config.minstret_undefined{return None}
  Some(match a {
  0x100=>self.mstatus&0x8000_0003_000d_e133,0x104=>self.mie&self.mideleg,0x105=>self.stvec,0x106=>self.scounteren,0x140=>self.sscratch,0x141=>self.sepc,0x142=>self.scause,0x143=>self.stval,0x144=>self.mip&self.mideleg,0x180=>self.satp,
  0x300=>self.mstatus,0x301=>self.misa,0x302=>self.medeleg,0x303=>self.mideleg,0x304=>self.mie,0x305=>self.mtvec,0x306=>self.mcounteren,0x320=>self.mcountinhibit,0x340=>self.mscratch,0x341=>self.mepc,0x342=>self.mcause,0x343=>self.mtval,0x344=>self.mip,
  0xb00|0xc00=>self.mask(self.counter),0xc01=>self.mask(self.time_ticks()),0xb02|0xc02=>self.mask(self.instret),0xb80|0xc80 if self.config.xlen==32=>self.counter>>32,0xc81 if self.config.xlen==32=>self.time_ticks()>>32,0xb82|0xc82 if self.config.xlen==32=>self.instret>>32,
- 0xf11|0xf12|0xf13|0xf14=>0,
+ 0xf11=>self.mvendorid,0xf12=>self.marchid,0xf13|0xf14=>0,
  0x3a0..=0x3af=>{let stride=if self.config.xlen==32{4}else{8};if stride==8&&a&1!=0{return None}let first=(a-0x3a0)as usize*4;if first>=self.config.pmp_registers as usize{return None}let mut v=0;for j in 0..stride{v|=(self.pmpcfg[first+j]as u64)<<(j*8)}v},
  0x3b0..=0x3ef=>{let i=(a-0x3b0)as usize;if i>=self.config.pmp_registers as usize{return None}self.effective_pmp_addr(i)},_=>return None})}
  fn csr_write(&mut self,a:u32,v:u64)->bool{match a{
@@ -130,6 +138,55 @@ impl Machine {
  fn would_write(&self,ins:u32)->Option<u64>{match ins&127{0x17=>Some(self.mask(self.pc.wrapping_add(sext((ins&0xfffff000)as u64,32)))),0x37=>Some(self.mask(sext((ins&0xfffff000)as u64,32))),_=>None}}
  fn stop_simulation(&mut self,reason:&'static str){println!("Info (EXC_FS) {reason}: Stopping at 0x{:x}",self.pc);self.exit=Exit::Stop(reason);if self.ecall_reg.is_some(){self.print_verdict()}}
  fn print_verdict(&self){println!("{}",if self.ecall_pass{"Test PASSED"}else{"Test FAILED"})}
+
+ /// Advance exactly one instruction, for the DPI lane.
+ ///
+ /// This mirrors the front half of `run()` — alignment, fetch, decode, execute,
+ /// then retire or trap — with the command-line features left out: no interrupt
+ /// injection, no stop points, no coverage window, no halt symbol. Interrupts are
+ /// excluded deliberately. The testbench drives the DUT's `irq_i` and compares
+ /// only retired instructions, so honouring a `mip` bit the DUT has not taken (or
+ /// hiding one it has) would desynchronise the two models; interrupts the firmware
+ /// does take arrive as ordinary traps and resynchronise through `Flow::Trap`.
+ pub fn step_one(&mut self)->Result<StepReport,String>{
+  let pc=self.pc;
+  let alignment=if self.ext(b'C'){2}else{4};
+  if self.pc%alignment!=0 {self.take_trap(0,self.pc)?;return Ok(StepReport{pc,insn:0,len:0,flow:Flow::Trap(0,pc)})}
+  let low=match self.load_access(self.pc,2,2){Ok(v)=>v as u32,Err((c,v))=>{self.take_trap(c,v)?;return Ok(StepReport{pc,insn:0,len:0,flow:Flow::Trap(c,v)})}};
+  let (ins,len)=if low&3!=3 {(low,2)} else {
+   let hi=match self.load_access(self.mask(self.pc.wrapping_add(2)),2,2){Ok(v)=>v as u32,Err((c,v))=>{self.take_trap(c,v)?;return Ok(StepReport{pc,insn:low,len:0,flow:Flow::Trap(c,v)})}};
+   (low|(hi<<16),4)
+  };
+  if self.mcountinhibit&1==0 {self.counter=self.counter.wrapping_add(1)}
+  if let Some(h)=self.hist.as_mut(){*h.entry(self.pc).or_insert(0)+=1}
+  if let Some(f)=self.trace.as_mut(){let _=std::io::Write::write_fmt(f,format_args!("{:08x}\n",self.pc));}
+  let decoded=if len==2 {if self.ext(b'C'){self.decompress(ins as u16)}else{None}}else{Some(ins)};
+  let flow=if let Some(i)=decoded {self.exec(i,len)?} else {Flow::Trap(2,ins as u64)};
+  match flow{
+   Flow::Trap(c,v)=>self.take_trap(c,if c==2{ins as u64}else{v})?,
+   Flow::Next=>{if self.mcountinhibit&4==0{self.instret=self.instret.wrapping_add(1)}}
+  }
+  Ok(StepReport{pc,insn:ins,len,flow})
+ }
+
+ /// RVVI decode string for the step-and-compare sampler.
+ ///
+ /// `uvmt_cv32e40p_iss_wrap::sample()` scans it with
+ /// `$sscanf(decode,"%s %s %s %s %s",...)` and hands every token after the
+ /// mnemonic to `split()`, which calls `uvm_fatal` unless the token contains a
+ /// `:`. That fixes the format: one mnemonic, then at most four space-free
+ /// `key:value` operands. The literal `ecall` is special — the wrapper reports an
+ /// `ecall` trap as a retired instruction only when `state.decode == "ecall"`.
+ pub fn decode_string(&self,insn:u32,len:u64)->String{
+  match insn {0x0000_0073=>return "ecall".into(),0x0010_0073=>return "ebreak".into(),_=>{}}
+  let decoded=if len==2 {self.decompress(insn as u16)}else{Some(insn)};
+  let (name,o)=match decoded.and_then(|i|self.decode_cover(i)){
+   Some(x)=>x,
+   None=>return format!("unknown rd:0 rs1:0 rs2:0 raw:{insn:08x}")
+  };
+  let name=if len==2 {self.compressed_name(insn as u16).unwrap_or(name)}else{name};
+  format!("{name} rd:{} rs1:{} rs2:{} imm:{}",o.rd,o.rs1,o.rs2,o.imm)
+ }
  fn compressed_name(&self,h:u16)->Option<&'static str>{let c=h as u32;Some(match(c&3,c>>13){(0,0)=>"c.addi4spn",(0,2)=>"c.lw",(0,3)=>"c.ld",(0,6)=>"c.sw",(0,7)=>"c.sd",(1,0)=>if c&0xfffc==0{"c.nop"}else{"c.addi"},(1,1)=>if self.config.xlen==32{"c.jal"}else{"c.addiw"},(1,2)=>"c.li",(1,3)=>if (c>>7)&31==2{"c.addi16sp"}else{"c.lui"},(1,4)=>match(c>>10)&3{0=>"c.srli",1=>"c.srai",2=>"c.andi",_=>if c&0x1000==0{["c.sub","c.xor","c.or","c.and"][((c>>5)&3)as usize]}else{["c.subw","c.addw"][((c>>5)&1)as usize]}},(1,5)=>"c.j",(1,6)=>"c.beqz",(1,7)=>"c.bnez",(2,0)=>"c.slli",(2,2)=>"c.lwsp",(2,3)=>"c.ldsp",(2,4)=>if c&0x1000==0{if c&0x7c==0{"c.jr"}else{"c.mv"}}else if c&0x7c==0{if c&0xf80==0{"c.ebreak"}else{"c.jalr"}}else{"c.add"},(2,6)=>"c.swsp",(2,7)=>"c.sdsp",_=>return None})}
  fn decode_cover(&self,i:u32)->Option<(&'static str,crate::cov::Operands64)>{
  let op=i&127;let f=(i>>12)&7;let top=i>>25;let rd=((i>>7)&31)as usize;let rs1=((i>>15)&31)as usize;let rs2=((i>>20)&31)as usize;let mut imm=sext((i>>20)as u64,12)as i64;
