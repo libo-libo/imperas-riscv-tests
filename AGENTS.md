@@ -658,3 +658,28 @@ files pin `mstatus`, `misa`, `mtvec`, `mepc`, `mcause`, `mtval`, `mip`/`mie`, `m
 `instret` and `mhartid` only. Those are implemented and byte-identical; the other rows are
 documented above as the exact place where further rows would have to be derived, rather than
 guessed.
+
+## DPI-C model for the core-v-verif testbench (`rust-iss/src/dpi.rs`)
+
+The `cv32e40p` UVM testbench in core-v-verif compares a reference model against the RTL
+instruction by instruction. Its Imperas model is licence-dead here, so `rust-iss` also builds a
+`cdylib` (`[lib] name = "cv32dpi"`, root `src/dpi.rs`) that VCS loads with `-sv_lib`. It is a
+second entry point into the same interpreter, not a library of the CLI binary.
+
+- Boundary is scalar-only (`-dpiheader` is unavailable in VCS 2023.12): `svimp_entry`,
+  `svimp_exit` in, `svexp_step`, `svexp_dmiWrite`, `svexp_setGPR`, `svexp_setCSR`,
+  `svexp_setDECODE`, `svexp_setRESULT` out. Verify with
+  `nm -D --undefined-only target/release/libcv32dpi.so`.
+- `Machine::step_one` executes exactly one instruction and reports `StepReport`; `run()`'s
+  command-line features (stop points, halt symbol, coverage window, interrupt injection) do not
+  apply. Interrupts are excluded deliberately — the testbench owns `irq_i`.
+- `Memory::mirror` records the word index of every store so the lane can mirror into the
+  simulator's RAM array; it is `None` on the CLI path.
+- `config()` clears the `S`/`U` bits of `misa` for this target: the DUT reports `0x40001104`, and
+  firmware compares `misa` against that constant, so any extra letter desynchronises the run.
+- The SV wrapper in core-v-verif requires `decode_string` to be
+  `"<insn> <key>:<val> ... "` (four key/value pairs) because it `$sscanf`s five `%s` tokens;
+  `ecall`/`ebreak` are the tolerated bare forms.
+- Verified: `hello-world` passes step-and-compare with zero mismatches (10955 PC, 350560 GPR,
+  120505 CSR comparisons). Programs that need `irq_i` or debug halt requests cannot pass by
+  construction.
