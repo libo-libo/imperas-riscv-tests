@@ -34,6 +34,11 @@ pub struct Semihost {fds:BTreeMap<i32,File>, closed:[bool;3], heap_base:u64, hea
 impl Default for Semihost {fn default()->Self {Self::new()}}
 impl Semihost {
     pub fn new()->Self {Self{fds:BTreeMap::new(),closed:[false;3],heap_base:0,heap_end:0,args:Vec::new()}}
+    /// Syscall numbers `handle` implements; anything else is "unhandled" to
+    /// the platform's PK layer.
+    pub fn supports(nr:u64)->bool {
+        matches!(nr,48|56|57|62|63|64|79|80|93|94|169|214|1024|1033|1038|2011)
+    }
     pub fn set_brk(&mut self,base:u64) {self.heap_base=base;self.heap_end=base;}
     fn valid(&self,fd:i32)->bool {self.fds.contains_key(&fd)||(fd>=0&&fd<3&&!self.closed[fd as usize])}
     fn resolve(&self,dir:i32,p:PathBuf)->Result<PathBuf,i32> {

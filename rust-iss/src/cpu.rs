@@ -3,16 +3,39 @@ use crate::{config::CpuConfig, cov::Cov, memory::Memory, semihost::Semihost};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Flow { Next, Trap(u64,u64) }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Exit { Running, Halt, Stop(&'static str), Terminate, Ecall }
+pub enum Exit { Running, Halt, Stop(&'static str), Terminate, Ecall, Syscall }
 pub struct Machine {
  pub x:[u64;32], pub pc:u64, pub mstatus:u64, pub misa:u64, pub mie:u64, pub mtvec:u64,
  pub mscratch:u64, pub mepc:u64, pub mcause:u64, pub mtval:u64, pub mip:u64,
  pub counter:u64, pub mem:Memory, pub tohost:Option<u64>, pub instret:u64,
  pub finish_after:Option<u64>, pub finish_time:Option<f64>, pub sig_armed:bool,
- pub sig_lo:u64,pub sig_hi:u64,pub sig_writes:u64,pub cov:Option<Cov>,
+ pub sig_lo:u64,pub sig_hi:u64,pub sig_writes:u64,pub sig_min_writes:u32,pub cov:Option<Cov>,
  pub cov_lo:Option<u64>,pub cov_hi:Option<u64>,pub cov_on:bool,pub cov_counted:u64,
  pub halt_pc:Option<u64>,
+ /// Transcript lines produced while executing, in event order: the
+ /// `Warning (RISCV_IMA)` line for an unaligned fetch/load/store or an
+ /// `ebreak`, the first `SIGNATURE_DUMP_SFW` write, and `ICV_FN` when the
+ /// coverage window closes. They are kept here rather than printed so the
+ /// driver can splice them into the transcript at exactly that position. The
+ /// buffer holds bytes, not lines: `customControl` emits its raw console byte
+ /// through the same stream, so ordering survives without a marker.
+ pub events:Vec<u8>,
+ /// Whether the coverage window closed during the run (`ICV_FN`). The report is
+ /// then written before the halt; a window that never closes reports after it.
+ pub cov_closed:bool,
+ /// Offset in `events` just past `ICV_FN`: the coverage document is written
+ /// from there, so `WTH` and the signature words keep their later position.
+ pub cov_mark:Option<usize>,
+ /// Where the run ended and whether it ended on `write_tohost`; the signature
+ /// dump is driven from that callback, so both are reported from it.
+ pub final_pc:Option<u64>, pub halted_at_tohost:bool,
+ /// The instruction currently being executed, so an access fault can be
+ /// formatted the way the model formats it (pc, word, disassembly).
+ cur_ins:u32, pub cur_len:u64,
  pub hist:Option<std::collections::BTreeMap<u64,u64>>,pub trace:Option<std::fs::File>,
+ /// Per-instruction trace (`RUSTISS_ITRACE`, or `--trace` to stdout): pc, raw
+ /// word, privilege, disassembly and every GPR that changed.
+ pub itrace:Option<std::fs::File>,pub trace_stdout:bool,
  pub addr_mask:u64,pub stop_pc:Option<u64>,pub stop_opcode:Option<u32>,pub stop_terminate:Option<u64>,
  pub ecall_reg:Option<usize>,pub ecall_pass:bool,pub exit:Exit,pub config:CpuConfig,
  pub semihost:Option<Semihost>,pub privilege:u8,
@@ -32,7 +55,7 @@ pub struct StepReport { pub pc:u64, pub insn:u32, pub len:u64, pub flow:Flow }
 impl Machine {
  pub fn new(mem:Memory,pc:u64,tohost:Option<u64>,config:CpuConfig)->Self {
  let misa=config.extensions | if config.xlen==32 {1<<30} else {2<<62}; let mtvec=config.mtvec;
- Self{custom_control:false,logfile:None,custom_exit_pc:None,mvendorid:0,marchid:0,x:[0;32],pc,mstatus:0,misa,mie:0,mtvec,mscratch:0,mepc:0,mcause:0,mtval:0,mip:0,counter:0,mem,tohost,instret:0,finish_after:None,finish_time:None,sig_armed:false,sig_lo:0,sig_hi:0,sig_writes:0,cov:None,cov_lo:None,cov_hi:None,cov_on:false,cov_counted:0,halt_pc:None,hist:std::env::var_os("RUSTISS_PCDUMP").map(|_|Default::default()),trace:std::env::var("RUSTISS_TRACE").ok().and_then(|p|std::fs::File::create(p).ok()),addr_mask:u64::MAX,stop_pc:None,stop_opcode:None,stop_terminate:None,ecall_reg:None,ecall_pass:false,exit:Exit::Running,config,semihost:None,privilege:3,medeleg:0,mideleg:0,stvec:0,sscratch:0,sepc:0,scause:0,stval:0,satp:0,mcounteren:0,scounteren:0,mcountinhibit:0,pmpcfg:[0;64],pmpaddr:[0;64],reservation:None}
+ Self{custom_control:false,logfile:None,custom_exit_pc:None,mvendorid:0,marchid:0,x:[0;32],pc,mstatus:0,misa,mie:0,mtvec,mscratch:0,mepc:0,mcause:0,mtval:0,mip:0,counter:0,mem,tohost,instret:0,finish_after:None,finish_time:None,sig_armed:false,sig_lo:0,sig_hi:0,sig_writes:0,sig_min_writes:0,cov:None,cov_lo:None,cov_hi:None,cov_on:false,cov_counted:0,halt_pc:None,events:Vec::new(),cov_closed:false,cov_mark:None,final_pc:None,halted_at_tohost:false,cur_ins:0,cur_len:4,hist:std::env::var_os("RUSTISS_PCDUMP").map(|_|Default::default()),trace:std::env::var("RUSTISS_TRACE").ok().and_then(|p|std::fs::File::create(p).ok()),itrace:std::env::var("RUSTISS_ITRACE").ok().and_then(|p|std::fs::File::create(p).ok()),trace_stdout:false,addr_mask:u64::MAX,stop_pc:None,stop_opcode:None,stop_terminate:None,ecall_reg:None,ecall_pass:false,exit:Exit::Running,config,semihost:None,privilege:3,medeleg:0,mideleg:0,stvec:0,sscratch:0,sepc:0,scause:0,stval:0,satp:0,mcounteren:0,scounteren:0,mcountinhibit:0,pmpcfg:[0;64],pmpaddr:[0;64],reservation:None}
  }
  fn mask(&self,v:u64)->u64 {if self.config.xlen==32 {v as u32 as u64}else{v}}
  fn signed(&self,v:u64)->i64 {if self.config.xlen==32 {v as i32 as i64}else{v as i64}}
@@ -70,14 +93,31 @@ impl Machine {
  }Err(fault)
  }
  fn load_access(&mut self,a:u64,n:u32,access:u8)->Result<u64,(u64,u64)>{
- if a%n as u64!=0&&(access==2||!self.config.unaligned){return Err((if access==2{0}else{4},a))}
+ if a%n as u64!=0&&(access==2||!self.config.unaligned){
+  // An unaligned access is reported before it traps: the platform logs
+  // `Warning (RISCV_IMA)` with the effective address and then raises the
+  // exception the test's handler expects. Fetches are reported by `exec`, which
+  // knows the target address.
+  if access==0{self.warn("Load from unaligned address",a)}
+  return Err((if access==2{0}else{4},a))}
  let mut v=0;for i in 0..n {let va=self.mask(a.wrapping_add(i as u64));let pa=self.translate(va,access).map_err(|c|(c,a))?;let chunk=if i==0||va&4095==0{(n-i).min((4096-(va&4095))as u32)}else{1};if !self.pmp(pa,chunk,access,self.effective_priv(access)){return Err((if access==2{1}else{5},a))}let byte=if access==2{self.mem.fetch(pa,1)}else{self.mem.read(pa,1)};v|=byte.ok_or((if access==2{1}else{5},a))?<<(8*i);}Ok(v)
  }
  fn store_access(&mut self,a:u64,n:u32,v:u64)->Result<(),(u64,u64)>{
- if a%n as u64!=0&&!self.config.unaligned{return Err((6,a))}
+ if a%n as u64!=0&&!self.config.unaligned{self.warn("Store/atomic memory operation at unaligned address",a);return Err((6,a))}
  let mut physical=[0u64;8];for i in 0..n {let va=self.mask(a.wrapping_add(i as u64));let pa=self.translate(va,1).map_err(|c|(c,a))?;let chunk=if i==0||va&4095==0{(n-i).min((4096-(va&4095))as u32)}else{1};if !self.pmp(pa,chunk,1,self.effective_priv(1))||!self.mem.allowed(pa,1,2){return Err((7,a))}physical[i as usize]=pa;}
  for i in 0..n {if !self.mem.write(physical[i as usize],1,v>>(8*i)){return Err((7,a))}}
- self.reservation=None;if self.sig_armed&&a<=self.sig_hi&&a.saturating_add(n as u64-1)>=self.sig_lo{self.sig_writes+=1}if Some(a)==self.tohost{self.exit=Exit::Halt}Ok(())
+ self.reservation=None;
+ if self.sig_armed&&a<=self.sig_hi&&a.saturating_add(n as u64-1)>=self.sig_lo{
+  self.sig_writes+=1;
+  // `Signature Write N` reports the N-th store into the signature range: its
+  // address, its width and the data being stored. Not the merged word - that is
+  // why `SB-01`/`SH-01`/`SW-01` print the zero of their `sw x0,0(x1)` prologue
+  // while the signature later holds the byte/half/word the test writes. The
+  // model reports writes until `SignatureMinWrites` is reached and always at
+  // least the first one (measured: min 0/1 -> 1 line, min 2 -> 2, min 3 -> 3).
+  if self.sig_writes<=u64::from(self.sig_min_writes.max(1)){let m=if n>=8{u64::MAX}else{(1u64<<(8*n))-1};self.event(format!("Info (SIGNATURE_DUMP_SFW) Signature Write {} 0x{a:x} bytes {n} 0x{:x}",self.sig_writes,v&m));}
+ }
+ if Some(a)==self.tohost{self.exit=Exit::Halt}Ok(())
  }
  fn time_ticks(&self)->u64 {(self.counter as f64*self.config.mtime_hz/(self.config.mips*1_000_000.0))as u64}
  pub fn csr_read(&self,a:u32)->Option<u64>{
@@ -103,13 +143,15 @@ impl Machine {
  self.pc=self.mask((vec&!3)+if interrupt&&vec&3==1{4*c}else{0});self.reservation=None;Ok(())}
  pub fn run(&mut self)->Result<(),String>{let mut elapsed=0u64;loop{
  if self.exit!=Exit::Running{return Ok(())}if self.finish_after.is_some_and(|v|self.instret>=v){self.exit=Exit::Stop("instruction count");return Ok(())}if self.finish_time.is_some_and(|v|elapsed as f64>=v*self.config.mips*1_000_000.0){self.exit=Exit::Stop("simulation time");return Ok(())}elapsed=elapsed.wrapping_add(1);
- if Some(self.pc)==self.stop_pc{self.stop_simulation("address match");return Ok(())}if Some(self.pc)==self.stop_terminate{println!("Info (EXC_FT) Intercept 'terminate'.");self.exit=Exit::Terminate;if self.ecall_reg.is_some(){self.print_verdict()}return Ok(())}
+ if Some(self.pc)==self.stop_pc{self.stop_simulation("address match");return Ok(())}if Some(self.pc)==self.stop_terminate{self.event("Info (EXC_FT) Intercept 'terminate'.".to_string());self.exit=Exit::Terminate;if self.ecall_reg.is_some(){self.print_verdict()}return Ok(())}
  let pending=self.mie&self.mip;let mut irq=None;for c in [11,3,7,9,1,5]{if pending&(1<<c)!=0 {let delegated=self.mideleg&(1<<c)!=0;let enabled=if delegated{self.privilege<1||(self.privilege==1&&self.mstatus&2!=0)}else{self.privilege<3||self.mstatus&8!=0};if enabled{irq=Some(c);break}}}if let Some(c)=irq{self.take_trap((1<<(self.config.xlen-1))|c,0)?;continue}
  let alignment=if self.ext(b'C'){2}else{4};if self.pc%alignment!=0{self.take_trap(0,self.pc)?;continue}
  let low=match self.load_access(self.pc,2,2){Ok(v)=>v as u32,Err((c,v))=>{self.take_trap(c,v)?;continue}};
  let (ins,len)=if low&3!=3{(low,2)}else{let hi=match self.load_access(self.mask(self.pc.wrapping_add(2)),2,2){Ok(v)=>v as u32,Err((c,v))=>{self.take_trap(c,v)?;continue}};(low|(hi<<16),4)};
  if self.custom_control&&self.custom_exit_pc.is_some_and(|point|point>=self.pc&&point<self.pc.saturating_add(len)){self.exit=Exit::Terminate;return Ok(())}
- if self.custom_control&&ins==0x0005200b{if self.x[10]==0{self.exit=Exit::Halt;return Ok(())}let byte=[self.x[10]as u8];std::io::Write::write_all(&mut std::io::stdout(),&byte).map_err(|e|format!("customControl stdout: {e}"))?;if let Some(file)=self.logfile.as_mut(){std::io::Write::write_all(file,&byte).map_err(|e|format!("customControl logfile: {e}"))?;}self.pc=self.mask(self.pc.wrapping_add(4));if self.mcountinhibit&1==0{self.counter=self.counter.wrapping_add(1)}if self.mcountinhibit&4==0{self.instret=self.instret.wrapping_add(1)}continue}
+ // `customControl`: the low byte of `a0` goes to the console stream (the same
+  // one the transcript uses, hence the byte buffer) and to the custom logfile.
+  if self.custom_control&&ins==0x0005200b{if self.x[10]==0{self.exit=Exit::Halt;return Ok(())}let byte=[self.x[10]as u8];self.events.push(byte[0]);if let Some(file)=self.logfile.as_mut(){std::io::Write::write_all(file,&byte).map_err(|e|format!("customControl logfile: {e}"))?;}self.pc=self.mask(self.pc.wrapping_add(4));if self.mcountinhibit&1==0{self.counter=self.counter.wrapping_add(1)}if self.mcountinhibit&4==0{self.instret=self.instret.wrapping_add(1)}continue}
  if self.stop_opcode==Some(ins){self.stop_simulation("opcode match");return Ok(())}
  if self.mcountinhibit&1==0{self.counter=self.counter.wrapping_add(1)}
  if let Some(h)=self.hist.as_mut(){*h.entry(self.pc).or_insert(0)+=1}if let Some(f)=self.trace.as_mut(){let _=std::io::Write::write_fmt(f,format_args!("{:08x}\n",self.pc));}
@@ -122,22 +164,119 @@ impl Machine {
  // register state it would have executed with.
  if self.halt_pc==Some(self.pc){
   if let Some((name,mut operands))=cover{operands.rd_val=self.would_write(ins).unwrap_or(self.x[operands.rd]);if let Some(c)=self.cov.as_mut(){if c.record_named(name,&operands){self.cov_counted+=1}}}
-  self.exit=Exit::Halt;return Ok(())
+  self.exit=Exit::Halt;self.final_pc=Some(self.pc.wrapping_add(len));self.halted_at_tohost=true;return Ok(())
  }
+ let trace_snap=if self.itrace.is_some()||self.trace_stdout{Some((self.x,self.pc,self.privilege))}else{None};
  let flow=if let Some(i)=decoded{self.exec(i,len)?}else{Flow::Trap(2,ins as u64)};
  match flow{Flow::Trap(c,v)=>self.take_trap(c,if c==2{ins as u64}else{v})?,Flow::Next=>{if self.mcountinhibit&4==0{self.instret=self.instret.wrapping_add(1)}}}
+ if let Some((old,pc,priv_))=trace_snap{self.write_itrace(old,pc,priv_,ins,len);}
  if self.exit==Exit::Running {if let Some((name,mut operands))=cover{operands.rd_val=self.x[operands.rd];if let Some(c)=self.cov.as_mut(){if c.record_named(name,&operands){self.cov_counted+=1}}}}
  // The instruction at the finish symbol is part of the window, exactly as the
  // original model counts it; the window closes after it executes.
- if cov_at_hi{self.cov_on=false}
+ if cov_at_hi{if let Some(hi)=self.cov_hi{self.event(format!("Info (ICV_FN) Finishing coverage at 0x{hi:x}"))}self.cov_on=false;self.cov_closed=true;self.cov_mark=Some(self.events.len())}
  }}
  /// The value a not-yet-executed instruction would write to `rd`. The original
  /// attributes coverage for the instruction it stops on (`write_tohost` entry)
  /// from that write, not from the register's previous contents; its prologue is
  /// an `auipc`, whose result is available without executing anything.
  fn would_write(&self,ins:u32)->Option<u64>{match ins&127{0x17=>Some(self.mask(self.pc.wrapping_add(sext((ins&0xfffff000)as u64,32)))),0x37=>Some(self.mask(sext((ins&0xfffff000)as u64,32))),_=>None}}
- fn stop_simulation(&mut self,reason:&'static str){println!("Info (EXC_FS) {reason}: Stopping at 0x{:x}",self.pc);self.exit=Exit::Stop(reason);if self.ecall_reg.is_some(){self.print_verdict()}}
- fn print_verdict(&self){println!("{}",if self.ecall_pass{"Test PASSED"}else{"Test FAILED"})}
+ /// Append one transcript line (newline included) to the event buffer.
+ fn event(&mut self,text:String){self.events.extend_from_slice(text.as_bytes());self.events.push(b'\n');}
+ /// Append one `Warning (RISCV_IMA)` line for the instruction being executed.
+ ///
+ /// Measured shape over the 23 distinct lines the suite produces: the severity
+ /// prefix is 42 columns, then the instruction's own pc, the fetched word, the
+ /// disassembly, and the faulting address in parentheses:
+ /// `Warning (RISCV_IMA) CPU 'riscvOVPsim/cpu' 0x800001ac 0011a203 lw      tp,1(gp): Load from unaligned address (0x80002001)`
+ fn warn(&mut self,msg:&str,addr:u64){
+  let text=format!("Warning (RISCV_IMA) CPU 'riscvOVPsim/cpu' 0x{:x} {:08x} {}: {msg} (0x{:x})",self.pc,self.cur_ins,self.warn_disasm(self.cur_ins,self.cur_len,self.pc),addr);
+  self.event(text);
+ }
+ /// The platform's rendering of the faulting instruction inside that warning:
+ /// mnemonic left aligned to 8 columns, ABI register names, one comma and no
+ /// space between operands, branch and jump targets in bare hex (no `0x`), and no
+ /// padding at all when there are no operands (`ebreak`).
+ fn warn_disasm(&self,ins:u32,len:u64,pc:u64)->String{
+  if len==2{return self.compressed_name(ins as u16).map(str::to_string).unwrap_or_else(||format!("0x{ins:04x}"));}
+  let g=|r:usize|crate::cov::gpr_name(r);
+  let rd=((ins>>7)&31)as usize;let r1=((ins>>15)&31)as usize;let r2=((ins>>20)&31)as usize;let f=(ins>>12)&7;
+  let im=sext((ins>>20)as u64,12)as i64;
+  match ins&127{
+   0x03=>{let m=match f{0=>"lb",1=>"lh",2=>"lw",3=>"ld",4=>"lbu",5=>"lhu",6=>"lwu",_=>return format!("0x{ins:08x}")};format!("{m:<8}{},{}({})",g(rd),im,g(r1))},
+   0x23=>{let m=match f{0=>"sb",1=>"sh",2=>"sw",3=>"sd",_=>return format!("0x{ins:08x}")};format!("{m:<8}{},{}({})",g(r2),sext((((ins>>25)<<5)|((ins>>7)&31))as u64,12)as i64,g(r1))},
+   0x63=>{let m=match f{0=>"beq",1=>"bne",4=>"blt",5=>"bge",6=>"bltu",7=>"bgeu",_=>return format!("0x{ins:08x}")};let off=sext((((ins>>31)<<12)|(((ins>>7)&1)<<11)|(((ins>>25)&63)<<5)|(((ins>>8)&15)<<1))as u64,13);format!("{m:<8}{},{},{:x}",g(r1),g(r2),self.mask(pc.wrapping_add(off)))},
+   0x6f=>{let off=sext((((ins>>31)<<20)|(((ins>>12)&255)<<12)|(((ins>>20)&1)<<11)|(((ins>>21)&1023)<<1))as u64,21);let t=self.mask(pc.wrapping_add(off));if rd==0{format!("{:<8}{:x}","j",t)}else{format!("{:<8}{},{:x}","jal",g(rd),t)}},
+   0x67=>if rd==0{if im==0{format!("{:<8}{}","jr",g(r1))}else{format!("{:<8}{}({})","jr",im,g(r1))}}else{format!("{:<8}{},{}({})","jalr",g(rd),im,g(r1))},
+   0x73 if f==0=>match ins{0x00000073=>"ecall".to_string(),0x00100073=>"ebreak".to_string(),0x30200073=>"mret".to_string(),0x10200073=>"sret".to_string(),0x10500073=>"wfi".to_string(),_=>format!("0x{ins:08x}")},
+   _=>self.trace_text(ins,len),
+  }
+ }
+ /// Emit one instruction-trace record. Fields are tab separated so the
+ /// `riscv-dv` converter never depends on column alignment:
+ /// `pc<TAB>word<TAB>privilege<TAB>disassembly<TAB>xN:old:new,...` (`-` = no write).
+ /// Hex values are zero padded to XLEN digits, matching the sail emulator's
+ /// `x5 <- 0x00002038` rendering, because the comparator compares the CSV
+ /// strings verbatim.
+ fn write_itrace(&mut self,old:[u64;32],pc:u64,priv_:u8,ins:u32,len:u64){
+  let w=if self.config.xlen==32{8}else{16};
+  let mut wb=String::new();
+  for r in 1..32{if self.x[r]!=old[r]{if !wb.is_empty(){wb.push(',')}wb.push_str(&format!("x{r}:{:0w$x}:{:0w$x}",old[r],self.x[r],w=w));}}
+  let text=self.trace_text(ins,len);
+  let line=format!("{pc:0w$x}\t{ins:0i$x}\t{priv_}\t{text}\t{}\n",if wb.is_empty(){"-"}else{wb.as_str()},w=w,i=if len==2{4}else{8});
+  if let Some(f)=self.itrace.as_mut(){let _=std::io::Write::write_all(f,line.as_bytes());}else{print!("{line}");}
+ }
+ /// Human-readable form of the fetched word for the trace. It is derived from
+ /// the same decode table coverage uses, so a mnemonic is only printed when the
+ /// instruction is one the ISS actually implements.
+ fn trace_text(&self,ins:u32,len:u64)->String{
+  if len==2{return self.compressed_name(ins as u16).map(|n|n.to_string()).unwrap_or_else(||format!("0x{ins:04x}"));}
+  let Some((name,_))=self.decode_cover(ins)else{return format!("0x{ins:08x}")};
+  let rd=((ins>>7)&31)as usize;let rs1=((ins>>15)&31)as usize;let rs2=((ins>>20)&31)as usize;
+  let imm=sext((ins>>20)as u64,12)as i64;
+  match ins&127{
+   0x37|0x17=>format!("{name} x{rd}, 0x{:x}",(ins>>12)&0xfffff),
+   0x6f=>format!("{name} x{rd}, {}",sext((((ins>>31)<<20)|(((ins>>12)&0xff)<<12)|(((ins>>20)&1)<<11)|(((ins>>21)&0x3ff)<<1))as u64,21)as i64),
+   0x67|0x03=>format!("{name} x{rd}, {imm}(x{rs1})"),
+   0x23=>format!("{name} x{rs2}, {}(x{rs1})",sext((((ins>>25)<<5)|((ins>>7)&31))as u64,12)as i64),
+   0x63=>format!("{name} x{rs1}, x{rs2}, {}",sext((((ins>>31)<<12)|(((ins>>7)&1)<<11)|(((ins>>25)&63)<<5)|(((ins>>8)&15)<<1))as u64,13)as i64),
+   0x13|0x1b=>format!("{name} x{rd}, x{rs1}, {imm}"),
+   0x33|0x3b=>format!("{name} x{rd}, x{rs1}, x{rs2}"),
+   0x2f=>format!("{name} x{rd}, x{rs2}, (x{rs1})"),
+   0x73=>if(ins>>12)&7==0{name.to_string()}else{format!("{name} x{rd}, 0x{:x}, x{rs1}",(ins>>20)&0xfff)},
+   _=>name.to_string(),
+  }
+ }
+ /// The model stops *before* the instruction executes, but its trace and
+ /// instruction counter still see the stopping word: a `--finishonsymbol` run
+ /// reports one instruction more than the number of retired instructions.
+ fn stop_simulation(&mut self,reason:&'static str){
+  if self.mcountinhibit&1==0{self.counter=self.counter.wrapping_add(1)}
+  if let Some(f)=self.trace.as_mut(){let _=std::io::Write::write_fmt(f,format_args!("{:08x}\n",self.pc));}
+  self.event(format!("Info (EXC_FS) {reason}: Stopping at 0x{:x}",self.pc));self.exit=Exit::Stop(reason);if self.ecall_reg.is_some(){self.print_verdict()}}
+ fn print_verdict(&mut self){self.event(if self.ecall_pass{"Test PASSED"}else{"Test FAILED"}.to_string())}
+
+ /// `simulateexceptions=F` with the default semihost: the `ecall` is a host
+ /// syscall and the guest resumes with the result in `a0`. A number the
+ /// semihost layer does not implement is not returned as an error to the
+ /// guest: the platform's PK handler prints `SYSCALL(unhandled(nr=...))` and
+ /// the run ends there, one instruction past the `ecall`.
+ fn syscall(&mut self)->Result<(),String>{
+  let nr=self.mask(self.x[17]);
+  if !Semihost::supports(nr){
+   let text=format!("Error (RISCV/PK) SYSCALL(unhandled(nr={}))",self.signed(nr));
+   self.event(text);
+   // The report shows the address after the rejected `ecall`, which the
+   // dispatcher has not written back yet when this event fires.
+   self.final_pc=Some(self.pc.wrapping_add(self.cur_len));
+   self.exit=Exit::Syscall;
+   return Ok(())
+  }
+  if self.semihost.is_none(){self.semihost=Some(Semihost::new())}
+  if let Some(handler)=self.semihost.as_mut(){
+   if let Some(status)=handler.handle(&mut self.x,&mut self.mem,self.config.xlen)?{self.ecall_pass=status==0;self.exit=Exit::Ecall}
+  }
+  Ok(())
+ }
 
  /// Advance exactly one instruction, for the DPI lane.
  ///
@@ -195,6 +334,8 @@ impl Machine {
  Some((name,crate::cov::Operands64{rd,rs1,rs2,imm,offset:imm,rd_val:0,rs1_val:self.x[rs1],rs2_val:self.x[rs2]}))
  }
  fn exec(&mut self,ins:u32,len:u64)->Result<Flow,String>{
+ // The fault reports (`Warning (RISCV_IMA)`) render the instruction from here.
+ self.cur_ins=ins;self.cur_len=len;
  let op=ins&127;let rd=((ins>>7)&31)as usize;let f=(ins>>12)&7;let r1=((ins>>15)&31)as usize;let r2=((ins>>20)&31)as usize;let f7=ins>>25;let a=self.x[r1];let b=self.x[r2];let im=sext((ins>>20)as u64,12);let pc=self.pc;let next=self.mask(pc.wrapping_add(len));let illegal=Flow::Trap(2,ins as u64);let mut target=next;let mut result=None;
  if self.ext(b'E') {let uses_rd=!matches!(op,0x23|0x63|0x0f);let uses_rs1=!matches!(op,0x37|0x17|0x6f|0x0f)&&!(op==0x73&&(f==0||f&4!=0));let uses_rs2=matches!(op,0x23|0x63|0x33|0x3b|0x2f);if uses_rd&&rd>=16||uses_rs1&&r1>=16||uses_rs2&&r2>=16{return Ok(illegal)}}
  match op{
@@ -211,7 +352,7 @@ impl Machine {
  if kind==3{let ok=self.reservation==Some((a,n));self.reservation=None;let pa=match self.translate(a,1){Ok(v)=>v,Err(c)=>return Ok(Flow::Trap(c,a))};if !self.pmp(pa,n,1,self.effective_priv(1)){return Ok(Flow::Trap(7,a))}if ok{if let Err((c,v))=self.store_access(a,n,b){return Ok(Flow::Trap(c,v))}}result=Some((!ok)as u64)}else{let old=match self.load_access(a,n,0){Ok(v)=>v,Err((c,v))=>return Ok(Flow::Trap(if kind==2{c}else{if c==13{15}else if c==5{7}else{c}},v))};if kind==2{self.reservation=Some((a,n))}else{let signed=|v:u64|if n==4{v as i32 as i64}else{v as i64};let val=match kind{0=>old.wrapping_add(b),1=>b,4=>old^b,8=>old|b,12=>old&b,16=>if signed(old)<signed(b){old}else{b},20=>if signed(old)>signed(b){old}else{b},24=>old.min(if n==4{b as u32 as u64}else{b}),28=>old.max(if n==4{b as u32 as u64}else{b}),_=>return Ok(illegal)};if let Err((c,v))=self.store_access(a,n,val){return Ok(Flow::Trap(c,v))}}result=Some(if n==4{sext(old,32)}else{old})}},
  0x0f=>{if f>1{return Ok(illegal)}},
  0x73=>{if f==0{match ins{
- 0x00000073=>{if let Some(r)=self.ecall_reg{self.ecall_pass=self.x[r]==1;self.print_verdict();self.exit=Exit::Ecall}else if let Some(handler)=self.semihost.as_mut(){if let Some(status)=handler.handle(&mut self.x,&mut self.mem,self.config.xlen)?{self.ecall_pass=status==0;self.exit=Exit::Ecall}}else{return Ok(Flow::Trap(8+self.privilege as u64,0))}},0x00100073=>return Ok(Flow::Trap(3,pc)),
+ 0x00000073=>{if let Some(r)=self.ecall_reg{self.ecall_pass=self.x[r]==1;self.print_verdict();self.exit=Exit::Ecall}else if self.config.default_semihost{self.syscall()?}else if self.config.simulate_exceptions{if let Some(handler)=self.semihost.as_mut(){if let Some(status)=handler.handle(&mut self.x,&mut self.mem,self.config.xlen)?{self.ecall_pass=status==0;self.exit=Exit::Ecall}}else{return Ok(Flow::Trap(8+self.privilege as u64,0))}}else{return Ok(Flow::Trap(8+self.privilege as u64,0))}},0x00100073=>{self.warn("EBREAK instruction executed",pc);return Ok(Flow::Trap(3,pc))},
  0x30200073 if self.privilege==3=>{let p=((self.mstatus>>11)&3)as u8;if p==2||(p==1&&!self.config.supervisor_mode)||(p==0&&!self.config.user_mode){return Ok(illegal)}self.privilege=p;self.mstatus=(self.mstatus&!0x1888)|((self.mstatus>>4)&8)|128;if p!=3{self.mstatus&=!(1<<17)}target=self.mepc},
  0x10200073 if self.config.supervisor_mode&&self.privilege>=1=>{if self.privilege==1&&self.mstatus&(1<<22)!=0{return Ok(illegal)}self.privilege=((self.mstatus>>8)&1)as u8;self.mstatus=(self.mstatus&!0x122)|((self.mstatus>>4)&2)|32;self.mstatus&=!(1<<17);target=self.sepc},
  0x10500073=>{if self.privilege==0||(self.privilege!=3&&self.mstatus&(1<<21)!=0){return Ok(illegal)}if !self.config.wfi_is_nop&&self.mip&self.mie==0{return Err(format!("WFI at 0x{pc:x} is waiting with no external interrupt source"))}},
@@ -220,7 +361,7 @@ impl Machine {
  if (0xc00..=0xc1f).contains(&csr)||(0xc80..=0xc9f).contains(&csr){let bit=csr&31;if self.privilege<3&&self.mcounteren&(1<<bit)==0||self.privilege==0&&self.scounteren&(1<<bit)==0{return Ok(illegal)}}
  let mode=f&3;if mode==0{return Ok(illegal)}let src=if f&4!=0{r1 as u64}else{a};let write=mode==1||r1!=0;let old=match self.csr_read(csr){Some(v)=>v,None=>return Ok(illegal)};if write{if csr>>10==3{return Ok(illegal)}let val=match mode{1=>src,2=>old|src,_=>old&!src};if !self.csr_write(csr,val){return Ok(illegal)}}result=Some(old)}},
  _=>return Ok(illegal)}
- if target%(if self.ext(b'C'){2}else{4})!=0{return Ok(Flow::Trap(0,target))}if let Some(v)=result{self.set_reg(rd,v)}self.pc=target;Ok(Flow::Next)
+ if target%(if self.ext(b'C'){2}else{4})!=0{self.warn("Fetch from unaligned address",target);return Ok(Flow::Trap(0,target))}if let Some(v)=result{self.set_reg(rd,v)}self.pc=target;Ok(Flow::Next)
  }
  fn decompress(&self,h:u16)->Option<u32>{
  let c=h as u32;let q=c&3;let f=c>>13;let rd=(c>>7)&31;let rs2=(c>>2)&31;let rp=8+((c>>7)&7);let sp=8+((c>>2)&7);let imm=sext((((c>>12)&1)<<5|((c>>2)&31))as u64,6)as u32;

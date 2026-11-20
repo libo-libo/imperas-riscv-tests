@@ -2,7 +2,14 @@
 pub struct Segment {
     pub addr: u64,
     pub vaddr: u64,
+    /// `p_paddr` as it appears in the file; `addr` may be rebased by
+    /// `--loadphysical`/`--loadaddress`, this one never is.
+    pub paddr: u64,
     pub memsz: u64,
+    /// `p_offset`, `p_filesz` and `p_align`, printed by the `OR_PD` table.
+    pub offset: u64,
+    pub filesz: u64,
+    pub align: u64,
     pub data: Vec<u8>,
     /// ELF PF_R=4, PF_W=2, PF_X=1.
     pub flags: u32,
@@ -71,8 +78,9 @@ pub fn parse(b: &[u8]) -> Result<Elf,String> {
             let last = memsz-1;
             if addr.checked_add(last).is_none() || vaddr.checked_add(last).is_none() || (!wide && (addr+last > u32::MAX as u64 || vaddr+last > u32::MAX as u64)) { return Err(format!("segment {i} address overflow")); }
         }
+        let align = word(b,o+if wide {48} else {28},width)?;
         let data = bytes(b,offset,filesz)?.to_vec();
-        segments.push(Segment { addr,vaddr,memsz,data,flags });
+        segments.push(Segment { addr,vaddr,paddr:addr,memsz,offset,filesz,align,data,flags });
     }
     let mut symbols = Vec::new();
     for i in 0..shnum {

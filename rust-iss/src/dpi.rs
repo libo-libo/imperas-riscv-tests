@@ -151,6 +151,12 @@ fn config() -> Result<CpuConfig, String> {
     // `_exit` ends in `wfi` with no interrupt source; the core treats it as a
     // hint and the firmware never returns from it.
     cfg.wfi_is_nop = true;
+    // The DUT raises the ecall exception; the model's command-line default
+    // hands the ecall to the semihost layer instead, which this lane must not
+    // inherit. Both knobs are needed: `defaultsemihost` is consulted before
+    // `simulateexceptions`.
+    cfg.default_semihost = false;
+    cfg.simulate_exceptions = true;
     Ok(cfg)
 }
 

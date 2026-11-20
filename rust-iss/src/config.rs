@@ -133,7 +133,7 @@ impl CpuConfig {
             cycle_undefined: false, mcycle_undefined: false, time_undefined: false,
             instret_undefined: false, minstret_undefined: false,
             hpmcounter_undefined: false, mhpmcounter_undefined: false,
-            default_semihost: true, simulate_exceptions: true,
+            default_semihost: true, simulate_exceptions: false,
         })
     }
     pub fn has_extension(&self, letter: char) -> bool {

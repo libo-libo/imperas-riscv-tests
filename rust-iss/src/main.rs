@@ -4,6 +4,7 @@
 
 mod cov;
 mod elf;
+mod logx;
 mod yaml;
 mod memory;
 mod semihost;
@@ -56,6 +57,9 @@ struct Opts {
     stop_address: Option<u64>,
     /// `--finishonterminate`: stop when the `terminate` symbol is entered.
     finish_on_terminate: bool,
+    /// `--finishonwritetohost`: arms the exitControl write_tohost intercept,
+    /// which announces itself once during the platform build.
+    finish_on_writetohost: bool,
     /// `--finishonopcode`: stop on the fetched word equal to this value.
     finish_on_opcode: Option<u32>,
     /// `--ecallresultreg` (or `sigdump/ResultReg`). `None` leaves the model's
@@ -74,6 +78,9 @@ struct Opts {
     argv: Vec<String>, envp: Vec<String>, memories: Vec<String>, objects: Vec<(String,bool)>,
     load_physical: bool, load_address: Option<u64>, entry_address: Option<u64>,
     sign_extend: bool, finish_time: Option<f64>, signature_at_end: bool,
+    /// `--trace`: write the per-instruction trace to stdout (or to
+    /// `RUSTISS_ITRACE` when that is set).
+    trace: bool,
 }
 
 impl Default for Opts {
@@ -111,6 +118,7 @@ impl Default for Opts {
             stop_symbol: None,
             stop_address: None,
             finish_on_terminate: false,
+            finish_on_writetohost: false,
             finish_on_opcode: None,
             // Unset means the model does not read a result register at all, so
             // it prints no verdict; 3/10/28 select gp/a0/t3.
@@ -120,6 +128,7 @@ impl Default for Opts {
             version: false,
             finish_after: None,
             cover_instructions: None,
+            trace: false,
             argv: Vec::new(), envp: Vec::new(), memories: Vec::new(), objects: Vec::new(),
             load_physical: true, load_address: None, entry_address: None, sign_extend: false,
             finish_time: None, signature_at_end: true,
@@ -235,11 +244,10 @@ fn parse_args() -> Result<Opts, String> {
                 }
             }
             "--nosimulation" => o.nosimulation = true,
-            // The exitControl model always finishes on the `write_tohost`
-            // intercept; this option only sets a flag the model already has,
-            // so it changes nothing observable (the log's `exit` line reports
-            // the halt either way).
-            "--finishonwritetohost" => {}
+            // A run already ends on the sigdump model's `write_tohost`
+            // callback; this additionally arms exitControl's own intercept,
+            // which prints `Intercept 'write_tohost'.` during the build.
+            "--finishonwritetohost" => o.finish_on_writetohost = true,
             "--finishafter" => {
                 let v = take(name)?;
                 o.finish_after = Some(
@@ -286,7 +294,8 @@ fn parse_args() -> Result<Opts, String> {
             "--readmefile" | "--versionsfile" => {
                 let _ = take(name)?;
             }
-            "--usehwregnames" | "--trace" => {}
+            "--usehwregnames" => {}
+            "--trace" => o.trace = true,
             "--help" | "-h" | "--helpall" => {
                 print_help();
                 std::process::exit(0);
@@ -330,7 +339,7 @@ fn print_help() {
     println!("  --finishonaddress <addr>    stop at an address (alias --exitonaddress)");
     println!("  --finishonopcode <word>     stop before a fetched instruction word");
     println!("  --finishonterminate         honour the terminate intercept");
-    println!("  --finishonwritetohost       accepted; write_tohost already ends every run");
+    println!("  --finishonwritetohost       stop on the write_tohost intercept");
     println!("  --ecallresultreg <3|10|28>  pass/fail register used by the ecall intercept");
     println!("  --logfile <file>            write the run transcript here");
     println!();
@@ -363,12 +372,14 @@ fn print_help() {
     println!("  --showvariants              list the processor variants and exit");
     println!("  --readmefile <path>         consumes the path; no document is generated");
     println!("  --versionsfile <path>       consumes the path; no document is generated");
-    println!("  --usehwregnames, --trace    accepted, no effect");
+    println!("  --usehwregnames             accepted, no effect");
+    println!("  --trace                     print an instruction trace to stdout");
+    println!("                              (or to RUSTISS_ITRACE=<file> when set)");
     println!();
     println!("Overrides, riscvOVPsim/cpu/<path>=<value>");
     println!("  sigdump/SignatureFile, SignatureGranularity, SignatureDumpToStdout,");
     println!("          SignatureAtEnd, SignatureMinWrites, ResultReg, StartSymbol,");
-    println!("          EndSymbol, StartAddress, EndAddress, BytesCount");
+    println!("          EndSymbol, StartAddress, EndAddress, ByteCount");
     println!("  customcontrol/logfile");
     println!("  cpu/variant, reset_address, mtvec, mtvec_mask, mtvec_is_ro, tvec_align,");
     println!("      unaligned, Zam, unalignedV, wfi_is_nop, wfi_resume_not_trap, mips,");
@@ -443,8 +454,8 @@ fn apply_override(o: &mut Opts, spec: &str) -> Result<(), String> {
         "sigdump/endaddress" => {
             o.end_address = Some(parse_address(value).ok_or_else(|| format!("EndAddress '{value}'"))?)
         }
-        "sigdump/bytescount" | "sigdump/bytecount" => {
-            o.byte_count = Some(parse_address(value).ok_or_else(|| format!("BytesCount '{value}'"))?)
+        "sigdump/bytecount" => {
+            o.byte_count = Some(parse_address(value).ok_or_else(|| format!("ByteCount '{value}'"))?)
         }
         _ => o.ignored_overrides.push(spec.to_string()),
     }
@@ -461,20 +472,64 @@ fn is_true(s: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 
-/// The platform's `vmiMessage(severity, code, fmt, ...)` prints
-/// `<Severity> (<code>) <text>`, the shape of every transcript line in
-/// `riscv-ovpsim/README.md` (`Info (OR_OF) Target 'riscvOVPsim/cpu' has object
-/// file read from ...`) and of the original's own startup banner
-/// (`Fatal (PER_TMO) Product riscvOVPsim version ...`).
-fn vmi_message(sev: char, code: &str, text: &str) {
-    let name = match sev {
-        'I' => "Info",
-        'W' => "Warning",
-        'E' => "Error",
-        'F' => "Fatal",
-        _ => "Unknown severity",
-    };
-    println!("{name} ({code}) {text}");
+/// The platform transcript.
+///
+/// stdout receives `body` verbatim, chunk by chunk as it is produced (that is
+/// what the original does, and it keeps a `customControl` console byte in its
+/// place in the stream). `--logfile` receives the session header, the same
+/// body, and the `Info Session ended` footer, written when the run finishes.
+struct Transcript {
+    header: String,
+    body: Vec<u8>,
+}
+
+impl Transcript {
+    fn new(stamp: &str) -> Transcript {
+        // The header echoes the command line as given, so the flag column is
+        // the process's own argv with `argv[0]` on the `Info PROGRAM` line.
+        let mut argv = std::env::args();
+        let exe = argv.next().unwrap_or_default();
+        let rest: Vec<String> = argv.collect();
+        Transcript {
+            header: logx::header(&exe, stamp, &rest),
+            body: Vec::new(),
+        }
+    }
+
+    fn raw(&mut self, text: &str) {
+        self.body.extend_from_slice(text.as_bytes());
+        print!("{text}");
+    }
+
+    /// Raw interleaved bytes (`customControl` console output).
+    fn bytes(&mut self, b: &[u8]) {
+        use std::io::Write as _;
+        if b.is_empty() {
+            return;
+        }
+        self.body.extend_from_slice(b);
+        let out = std::io::stdout();
+        let mut lock = out.lock();
+        let _ = lock.write_all(b);
+        let _ = lock.flush();
+    }
+
+    /// `<Severity> (<code>) <text>`, the shape of every `vmiMessage` line in
+    /// `riscv-ovpsim/README.md`.
+    fn msg(&mut self, sev: char, code: &str, text: &str) {
+        let line = logx::line(sev, code, text);
+        self.raw(&line);
+    }
+
+    /// Write the `--logfile` document: header, body, footer.
+    fn publish(&self, o: &Opts, stamp: &str) -> Result<(), String> {
+        let Some(path) = &o.logfile else { return Ok(()) };
+        let mut doc = Vec::with_capacity(self.header.len() + self.body.len() + 128);
+        doc.extend_from_slice(self.header.as_bytes());
+        doc.extend_from_slice(&self.body);
+        doc.extend_from_slice(logx::session_ended(stamp).as_bytes());
+        std::fs::write(path, doc).map_err(|e| format!("cannot write logfile '{path}': {e}"))
+    }
 }
 
 
@@ -482,11 +537,10 @@ fn vmi_message(sev: char, code: &str, text: &str) {
 // Program loading
 // ---------------------------------------------------------------------------
 
-fn load_program(path: &str, o: &Opts) -> Result<(elf::Elf, Memory), String> {
+fn load_program(bytes: &[u8], o: &Opts) -> Result<(elf::Elf, Memory), String> {
     let mut mem = Memory::new(o.address_bits);
     for region in &o.memories { mem.configure(region)?; }
-    let bytes = std::fs::read(path).map_err(|e| format!("cannot read '{path}': {e}"))?;
-    let mut image = elf::parse(&bytes)?;
+    let mut image = elf::parse(bytes)?;
     fn install(image: &mut elf::Elf, mem: &mut Memory, o: &Opts) -> Result<(), String> {
         let base=image.segments.iter().map(|s|if o.load_physical{s.addr}else{s.vaddr}).min().unwrap_or(0);
         let xlen=image.xlen;
@@ -507,6 +561,32 @@ fn load_program(path: &str, o: &Opts) -> Result<(elf::Elf, Memory), String> {
     Ok((image,mem))
 }
 
+/// Read and load one program, reporting the platform's own diagnostics for the
+/// two failures it can see: a file that cannot be opened and bytes that are not
+/// an ELF. A parse failure of a secondary `--objfile` is reported against the
+/// primary path, which is the only name the caller supplies.
+fn open_program(
+    path: &str,
+    o: &Opts,
+    t: &mut Transcript,
+) -> Result<(elf::Elf, Memory), ()> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                t.msg('E', "OR_FNF", &format!("File '{path}' was not found."));
+            } else {
+                t.msg('E', "OR_FOF", &format!("Failed to open file {path}"));
+                t.msg('E', "OR_INV", &format!("File '{path}' was not recognised as one of these formats: ELF"));
+            }
+            return Err(());
+        }
+    };
+    load_program(&bytes, o).map_err(|_| {
+        t.msg('E', "OR_INV", &format!("File '{path}' was not recognised as one of these formats: ELF"));
+    })
+}
+
 fn symbol(image: &elf::Elf, name: &str) -> Option<u64> {
     image
         .symbols
@@ -520,18 +600,32 @@ fn symbol(image: &elf::Elf, name: &str) -> Option<u64> {
 // ---------------------------------------------------------------------------
 
 /// Signature-dump parameters resolved exactly as the OVP sigdump intercept
-/// model computes them in its `constructor` (evidence
-/// `ev_18bb3b1c0403e75a7752d9fe5e0d51c0d58a492e6f5621a86aae497c6e1747b2`):
+/// model reports them in its `constructor` (evidence
+/// `ev_18bb3b1c0403e75a7752d9fe5e0d51c0d58a492e6f5621a86aae497c6e1747b2`).
+///
+/// Every message below is measured against the shipped image, including the
+/// two failure shapes' double space after the code:
 ///
 /// * nothing at all is generated unless `SignatureFile` names a file -- the
 ///   model's dump routine is entirely inside `if (state->file)`, so a missing
 ///   `SignatureFile` also suppresses the `SignatureDumpToStdout` copy;
-/// * `StartAddress` wins over `StartSymbol`; the symbol defaults to
-///   `begin_signature` and a miss disables the dump;
-/// * `BytesCount` wins over the symbol/address difference;
-/// * the size is snapped to granularity blocks with the model's literal
-///   arithmetic `((n + 1) - g) & ~g`, applied only when `n % g != 0`;
-/// * granularity must be 4 or 16, otherwise it falls back to 16.
+/// * `StartAddress` wins over `StartSymbol`; only a symbol that is actually
+///   consulted is announced (`FSB`/`FSE`), and the symbol lines (`SB`/`SE`)
+///   that follow are likewise per-symbol. An explicit address path therefore
+///   prints no symbol line at all;
+/// * `EndAddress` wins over `EndSymbol`, and `ByteCount` is inert here: the
+///   size is always the start/end difference. Its only other effect is the
+///   parameter's minimum-16 check (`OP_ULT`), which fails the platform build;
+/// * a negative size (end above start) is *not* rejected here: it flows into
+///   the write-callback range and fails as `MEM_HGM`, which aborts the
+///   platform build;
+/// * granularity must be 4 or 16, otherwise it falls back to 16 (`SFG`);
+/// * the size is snapped with the model's literal arithmetic
+///   `(n + 1 - g) & ~g`, applied only when `n % g != 0`. That yields 0 and
+///   negative results for small sizes (`sb_3` reduces 3 to 0, `sb_1` reduces 1
+///   to -6), so the snapshot is signed;
+/// * a failure prints `CF` (configuration failed, dump disabled) and then the
+///   specific reason, and is not fatal: the run continues without a dump.
 struct SigPlan {
     start: u64,
     bytes: u64,
@@ -539,72 +633,85 @@ struct SigPlan {
     min_writes: u32,
 }
 
-fn plan_signature(image: &elf::Elf, o: &Opts, warn: &mut Vec<String>) -> Option<SigPlan> {
+fn plan_signature(image: &elf::Elf, o: &Opts, t: &mut Transcript) -> Result<Option<SigPlan>, String> {
     if o.sig_file.is_none() {
-        return None;
+        return Ok(None);
     }
+    let start_name = o.start_symbol.as_deref().unwrap_or("begin_signature");
+    let end_name = o.end_symbol.as_deref().unwrap_or("end_signature");
+    let mut used_end_symbol = false;
     let start = match o.start_address {
         Some(a) => a,
-        None => {
-            let name = o.start_symbol.as_deref().unwrap_or("begin_signature");
-            match symbol(image, name) {
-                Some(v) => v,
-                None => {
-                    warn.push(format!(
-                        " Start symbol '{name}' not found, change symbol name or specify StartAddress"
-                    ));
-                    return None;
-                }
+        None => match symbol(image, start_name) {
+            Some(v) => {
+                t.msg('I', "SIGNATURE_DUMP_FSB", &format!("Found Symbol '{start_name}' in application at 0x{v:x}"));
+                v
             }
-        }
+            None => {
+                t.msg('W', "SIGNATURE_DUMP_CF", "Signature File configuration failed - disabled");
+                t.msg('W', "SIGNATURE_DUMP_SNF", &format!(" Start symbol '{start_name}' not found, change symbol name or specify StartAddress"));
+                return Ok(None);
+            }
+        },
     };
-    let mut size = match o.byte_count {
-        Some(n) => n,
-        None => {
-            let end = match o.end_address {
-                Some(a) => a,
-                None => {
-                    let name = o.end_symbol.as_deref().unwrap_or("end_signature");
-                    match symbol(image, name) {
-                        Some(v) => v,
-                        None => {
-                            warn.push(format!(
-                                " End symbol '{name}' not found, change symbol name or specify EndAddress or BytesCount"
-                            ));
-                            return None;
-                        }
-                    }
-                }
-            };
-            let fwd = end.wrapping_sub(start);
-            let bwd = start.wrapping_sub(end);
-            fwd.min(bwd)
-        }
+    let size = match o.end_address {
+        Some(a) => (a as i64).wrapping_sub(start as i64),
+        None => match symbol(image, end_name) {
+            Some(v) => {
+                used_end_symbol = true;
+                t.msg('I', "SIGNATURE_DUMP_FSE", &format!("Found Symbol '{end_name}' in application at 0x{v:x}"));
+                (v as i64).wrapping_sub(start as i64)
+            }
+            None => {
+                t.msg('W', "SIGNATURE_DUMP_CF", "Signature File configuration failed - disabled");
+                t.msg('W', "SIGNATURE_DUMP_ENF", &format!(" End symbol '{end_name}' not found, change symbol name or specify EndAddress or BytesCount"));
+                return Ok(None);
+            }
+        },
     };
     let mut gran = o.sig_granularity;
     if gran != 4 && gran != 16 {
-        warn.push(format!(
-            "Signature File Granularity {gran} not valid. May be 4 or 16 byte blocks. Setting to default 16 bytes"
-        ));
+        t.msg('W', "SIGNATURE_DUMP_SFG", &format!("Signature File Granularity {gran} not valid. May be 4 or 16 byte blocks. Setting to default 16 bytes"));
         gran = 16;
     }
-    if size % u64::from(gran) != 0 {
-        let snapped = size.wrapping_add(1).wrapping_sub(u64::from(gran)) & !u64::from(gran);
-        warn.push(format!(
-            "Signature size {size} is not a multiple of the granularity {gran}, using {snapped} bytes"
-        ));
-        size = snapped;
-    }
+    let size = if size % i64::from(gran) != 0 {
+        let snapped = size.wrapping_add(1).wrapping_sub(i64::from(gran)) & !i64::from(gran);
+        t.msg('W', "SIGNATURE_DUMP_SBB", &format!("Signature File format must be granularity byte blocks, reducing signature size {size} to {snapped} bytes"));
+        snapped
+    } else {
+        size
+    };
     if size == 0 {
-        warn.push(" Size is zero".to_string());
-        return None;
+        t.msg('W', "SIGNATURE_DUMP_CF", "Signature File configuration failed - disabled");
+        t.msg('W', "SIGNATURE_DUMP_SZ", " Size is zero");
+        return Ok(None);
     }
-    Some(SigPlan {
+    let file = o.sig_file.as_deref().unwrap_or("");
+    t.msg('I', "SIGNATURE_DUMP_EN", &format!("Signature File enabled, file '{file}'."));
+    t.msg('I', "SIGNATURE_DUMP_ES", &format!("Extracting signature from 0x{start:x} size {size} bytes"));
+    if o.start_address.is_none() {
+        t.msg('I', "SIGNATURE_DUMP_SB", &format!("Symbol '{start_name}' at 0x{start:x}"));
+    }
+    if used_end_symbol {
+        // The end symbol's own address, not the start: the message restates the
+        // resolved symbol rather than the computed range.
+        if let Some(v) = symbol(image, end_name) {
+            t.msg('I', "SIGNATURE_DUMP_SE", &format!("Symbol '{end_name}' at 0x{v:x}"));
+        }
+    }
+    if size < 0 {
+        // The model passes the signed size into the write callback, whose range
+        // check reports `(uint32_t)(size - 1)` zero-extended onto the start.
+        let upper = start.wrapping_add(((size - 1) as u32) as u64);
+        t.msg('E', "MEM_HGM", &format!("vmirtAddWriteCallback : address range 0x{start:x}:0x{upper:x} outside allowed range 0x0:0xffffffff"));
+        return Err(String::new());
+    }
+    Ok(Some(SigPlan {
         start,
-        bytes: size,
+        bytes: size as u64,
         gran,
         min_writes: o.sig_min_writes,
-    })
+    }))
 }
 
 /// Word order inside a line is the model's, not memory order: `signature`
@@ -641,24 +748,29 @@ fn emit_signature(p: &SigPlan, mem: &Memory) -> Result<String, String> {
 /// `writeResults` (0x159e80) tail: the coverage document, then the text report,
 /// then the `Info` block, which `reportCoverage` (0x155b10) always prints to
 /// stdout between two rule lines - with or without any output file.
-fn coverage_outputs(o: &Opts, cov: &cov::Cov, counted: u64, log: &mut String) -> Result<(), String> {
+fn coverage_outputs(
+    o: &Opts,
+    cov: &cov::Cov,
+    counted: u64,
+    t: &mut Transcript,
+) -> Result<(), String> {
     let ext = o.cover_ext.as_deref();
     if let Some(path) = &o.cover_file {
-        let _ = writeln!(log, "Writing coverage file {path}");
+        t.msg('I', "ICV_WCF", &format!("Writing coverage file {path}"));
         std::fs::write(path, cov.to_yaml())
             .map_err(|e| format!("Failed to write YAML file '{path}': {e}"))?;
-        let _ = writeln!(log, "Instruction Coverage finished");
+        t.msg('I', "ICV_FIN", "Instruction Coverage finished");
     }
     if let Some(path) = &o.cover_report {
-        let _ = writeln!(log, "Writing coverage report {path}");
+        t.msg('I', "ICV_WCR", &format!("Writing coverage report {path}"));
         let body = cov.write_report(ext, o.count_threshold, o.show_uncovered, counted);
         std::fs::write(path, body).map_err(|e| format!("Failed to write report file {path}: {e}"))?;
     }
-    print!(
-        "Info ---------------------------------------------------\n{}{}",
+    t.raw(&format!(
+        "{r}\n{}{r}\n",
         cov.info_block(ext, o.count_threshold, counted),
-        "Info ---------------------------------------------------\n"
-    );
+        r = logx::RULE
+    ));
     Ok(())
 }
 
@@ -667,30 +779,33 @@ fn coverage_outputs(o: &Opts, cov: &cov::Cov, counted: u64, log: &mut String) ->
 fn read_coverage_file(
     path: &str,
     cov: &mut cov::Cov,
-    log: &mut String,
+    t: &mut Transcript,
     errors: &mut u32,
 ) -> Result<(), String> {
-    let _ = writeln!(log, "Reading file {path}");
+    t.msg('I', "ICV_RD", &format!("Reading file {path}"));
     let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) => {
-            let _ = writeln!(log, "Failed to open file {path}: {e}");
+        Ok(text) => text,
+        Err(_) => {
+            t.msg('E', "ICV_IVF", &format!("{path} is not a file or a directory"));
             return Ok(());
         }
     };
     match yaml::parse(&text) {
         Ok(doc) => {
             for key in cov.merge_yaml(&doc) {
-                let _ = writeln!(log, "YAML content '{path}/{key}' not recognised.");
+                t.msg('E', "ICV_YNNF", &format!("YAML content '{key}' not recognised."));
+                *errors += 1;
             }
         }
-        Err(e) => {
-            let _ = writeln!(log, "YAML content '{path}' not recognised: {e}");
-            let _ = writeln!(
-                log,
-                "Either the cover specification is incorrect, the wrong model has been \
-                 selected or the version of the saved coverage data file does not match \
-                 the software"
+        Err(_) => {
+            // `ICV_YIC` is one fixed sentence: the reader only reports that the
+            // root is not a mapping, never the libyaml diagnostic behind it.
+            t.msg(
+                'E',
+                "ICV_YIC",
+                &format!(
+                    "File '{path}' does not have the expected YAML format. Root node is not a mapping"
+                ),
             );
             *errors += 1;
         }
@@ -704,7 +819,7 @@ fn read_coverage_file(
 fn read_coverage_dir(
     path: &str,
     cov: &mut cov::Cov,
-    log: &mut String,
+    t: &mut Transcript,
     errors: &mut u32,
 ) -> Result<(), String> {
     let entries = std::fs::read_dir(path).map_err(|e| format!("Failed to open directory {path}: {e}"))?;
@@ -713,50 +828,149 @@ fn read_coverage_dir(
         let name = entry.file_name().to_string_lossy().to_string();
         let child = format!("{path}/{name}");
         let is_file = entry.file_type().map(|t| t.is_file()).unwrap_or(false);
-        if !is_file || name.len() < 6 || !child[child.len() - 5..].eq_ignore_ascii_case(".yaml") {
+        if !is_file || name.len() < 5 || !child[child.len() - 5..].eq_ignore_ascii_case(".yaml") {
             continue;
         }
-        read_coverage_file(&child, cov, log, errors)?;
+        read_coverage_file(&child, cov, t, errors)?;
     }
     Ok(())
 }
 
-fn read_coverage_inputs(o: &Opts, cov: &mut cov::Cov, log: &mut String) -> Result<(), String> {
+/// `--inputfiles`: each comma-separated entry is a document or a directory to
+/// scan. `yamlReadFile` reports a path that exists as neither with `ICV_IVF`
+/// and carries on; a document it cannot parse or a key the tree does not know
+/// aborts the merge with `ICV_YINC` once every input has been offered.
+fn read_coverage_inputs(o: &Opts, cov: &mut cov::Cov, t: &mut Transcript) -> Result<(), String> {
     let mut errors = 0;
     if let Some(inputs) = &o.cover_inputs {
         for path in inputs.split(',').map(str::trim).filter(|p| !p.is_empty()) {
             match std::fs::metadata(path) {
-                Ok(md) if md.is_file() => read_coverage_file(path, cov, log, &mut errors)?,
-                Ok(md) if md.is_dir() => read_coverage_dir(path, cov, log, &mut errors)?,
-                _ => { let _ = writeln!(log, "{path} is not a file or a directory"); }
+                Ok(md) if md.is_file() => read_coverage_file(path, cov, t, &mut errors)?,
+                Ok(md) if md.is_dir() => read_coverage_dir(path, cov, t, &mut errors)?,
+                _ => t.msg('E', "ICV_IVF", &format!("{path} is not a file or a directory")),
             }
         }
     }
     if errors != 0 {
-        return Err(format!("Detected {errors} errors so cannot continue"));
+        return Err(String::new());
     }
     Ok(())
 }
 
-/// `--nosimulation`: merge the `--inputfiles` coverage documents into one tree
-/// and write the `--outputfile` document plus the `--reportfile` text, exactly
-/// as `writeResults` (0x159e80) does when no instruction was simulated.
-fn report_coverage(o: &Opts) -> Result<(), String> {
-    let xlen=config::CpuConfig::from_variant(o.variant.as_deref().unwrap_or("RV32I"))?.xlen;
-    let mut cov = cov::Cov::configured(o.cover_type.as_deref().unwrap_or("basic"),o.cover_ext.as_deref(),o.cover_instructions.as_deref(),xlen)?;
-    let mut log = String::new();
-    let _ = writeln!(
-        log,
-        "riscvOVPsim (Rust ISS {}): coverage merge",
-        env!("CARGO_PKG_VERSION")
-    );
-    read_coverage_inputs(o, &mut cov, &mut log)?;
-    let outcome = coverage_outputs(o, &cov, 0, &mut log);
-    let _ = writeln!(log, "instructions      : 0 (merged from {})", o.cover_inputs.as_deref().unwrap_or("-"));
-    if let Some(path) = &o.logfile {
-        std::fs::write(path, &log).map_err(|e| format!("cannot write logfile '{path}': {e}"))?;
+/// `ICV_YINC`: the merge is abandoned, the transcript gets one `Fatal` line and
+/// the whole run exits non-zero - no coverage document and no report are written.
+fn coverage_abort(o: &Opts, t: &mut Transcript, stamp: &str) -> Result<(), String> {
+    t.msg('F', "ICV_YINC", "Either the cover specification is incorrect, the wrong model has been selected or the version of the saved coverage data file does not match the software");
+    t.raw("Info Exiting\n");
+    t.publish(o, stamp)?;
+    Err(String::new())
+}
+
+/// Bind every `--override riscvOVPsim/cpu/<name>=<value>` to the CPU config.
+/// A name the model does not have is *not* a CLI error: the platform build
+/// reports it (`CF_UE`) after the loader has printed the program headers, so
+/// the specs are returned for the transcript instead of failing here.
+fn apply_overrides(config: &mut config::CpuConfig, o: &Opts) -> Result<Vec<String>, String> {
+    let mut unknown = Vec::new();
+    for spec in &o.ignored_overrides {
+        let (path, value) = spec.split_once('=').ok_or("invalid CPU override")?;
+        let name = path
+            .strip_prefix("riscvOVPsim/cpu/")
+            .or_else(|| path.strip_prefix("riscvOVPsim/"))
+            .unwrap_or(path);
+        match config.apply_override(name, value) {
+            Ok(()) => {}
+            Err(e) if e.starts_with("unsupported CPU override") => unknown.push(spec.clone()),
+            Err(e) => return Err(e),
+        }
     }
-    outcome
+    Ok(unknown)
+}
+
+/// `OP_FIP`: the platform never builds. The original prints one `CF_UE` per
+/// unmatched override, then gives up - no statistics, no signature, no
+/// shutdown banner, only `Info Session ended` from the session layer.
+fn platform_failed(
+    o: &Opts,
+    t: &mut Transcript,
+    stamp: &str,
+    unknown: &[String],
+) -> Result<(), String> {
+    for spec in unknown {
+        t.msg(
+            'E',
+            "CF_UE",
+            &format!("'--override {spec}' did not match anything in the platform"),
+        );
+    }
+    t.msg('E', "OP_FIP", "Failed to build platform 'riscvOVPsim'");
+    t.publish(o, stamp)?;
+    Err(String::new())
+}
+
+/// `--nosimulation`: no processor is created and no instruction is simulated.
+/// The run still announces the CPU model, prints the time statistics and the
+/// shutdown banner, and only *then* merges the `--inputfiles` coverage
+/// documents into the `--outputfile` document and the `--reportfile` text.
+/// This lane's `Info` block header carries no trailing space.
+fn report_coverage(
+    o: &Opts,
+    t: &mut Transcript,
+    stamp: &str,
+    started: std::time::Instant,
+) -> Result<(), String> {
+    let mut config = config::CpuConfig::from_variant(o.variant.as_deref().unwrap_or("RV32I"))?;
+    let unknown = apply_overrides(&mut config, o)?;
+    if !unknown.is_empty() {
+        return platform_failed(o, t, stamp, &unknown);
+    }
+    // A merge-only run still reads the object file the platform was told
+    // about: the header block lands before the coverage parameter lines, and a
+    // file that cannot be loaded stops the build after `OP_NOS`.
+    if let Some(program) = o.program.as_deref().or_else(|| o.objects.first().map(|p| p.0.as_str())) {
+        match open_program(program, o, t) {
+            Ok((image, _)) => t.raw(&logx::program(program, &image)),
+            Err(()) => {
+                t.msg('I', "OP_NOS", "Simulator finishing because 'nosimulation' was specified");
+                return platform_failed(o, t, stamp, &[]);
+            }
+        }
+    }
+    if o.cover_requested {
+        t.msg(
+            'I',
+            "ICV_PVSN",
+            &format!("parameter 'user_version' is '{}'", config.user_version),
+        );
+        t.msg('I', "ICV_ALI", "Pseudo instructions will be translated");
+    }
+    t.msg(
+        'I',
+        "OP_NOS",
+        "Simulator finishing because 'nosimulation' was specified",
+    );
+    let (user, system) = logx::cpu_times();
+    t.raw(&logx::time_stats(
+        0,
+        config.mips as u64,
+        user,
+        system,
+        started.elapsed().as_secs_f64(),
+    ));
+    t.raw(&logx::shutdown(stamp));
+    if o.cover_requested {
+        let mut cov = cov::Cov::configured(
+            o.cover_type.as_deref().unwrap_or("basic"),
+            o.cover_ext.as_deref(),
+            o.cover_instructions.as_deref(),
+            config.xlen,
+        )?;
+        if read_coverage_inputs(o, &mut cov, t).is_err() {
+            return coverage_abort(o, t, stamp);
+        }
+        coverage_outputs(o, &cov, 0, t)?;
+    }
+    t.publish(o, stamp)
 }
 
 fn run(o: &Opts) -> Result<(), String> {
@@ -768,30 +982,77 @@ fn run(o: &Opts) -> Result<(), String> {
         show_variants();
         return Ok(());
     }
-    if o.nosimulation {
-        return report_coverage(o);
-    }
-    let program = o.program.as_deref().or_else(||o.objects.first().map(|p|p.0.as_str())).ok_or("no --program or --objfile given")?;
     let variant = o.variant.as_deref().unwrap_or("RV32I");
     let mut config = config::CpuConfig::from_variant(variant)?;
-    for spec in &o.ignored_overrides {let (path,value)=spec.split_once('=').ok_or("invalid CPU override")?;let name=path.strip_prefix("riscvOVPsim/cpu/").or_else(||path.strip_prefix("riscvOVPsim/")).unwrap_or(path);config.apply_override(name,value)?;}
+    let unknown_overrides = apply_overrides(&mut config, o)?;
+
+    // Every transcript opens with the session header and the product banner,
+    // before anything is loaded or configured.
+    let stamp = logx::timestamp();
+    let started = std::time::Instant::now();
+    let mut t = Transcript::new(&stamp);
+    t.raw(&logx::banner(&stamp));
+    if o.variant.is_none() {
+        t.msg('I', "RISCV_ANS1", "Attribute 'variant' not specified; defaulting to 'RV32I'");
+    }
+    // A merge-only run never builds a platform: no program is needed and no
+    // ISA has to be executable, so the requirement comes after this branch.
+    if o.nosimulation {
+        return report_coverage(o, &mut t, &stamp, started);
+    }
+
+    let program = o.program.as_deref().or_else(||o.objects.first().map(|p|p.0.as_str())).ok_or("no --program or --objfile given")?;
     let unsupported=config.extensions & ![b'I',b'E',b'M',b'A',b'C',b'S',b'U'].iter().fold(0u64,|v,c|v|(1u64<<(*c-b'A')));
     if unsupported!=0||config.zfinx{return Err(format!("variant {variant} requests extensions without execution support (ISA mask 0x{unsupported:x}, Zfinx={}); supported execution is RV32/RV64 I/E/M/A/C/S/U",config.zfinx))}
     if config.zcea||config.zceb||config.zcee||config.zicbom||config.zicboz||config.zicbop||config.zfhmin||config.svpbmt||config.svinval{return Err("requested Zce/cache-block/half-float/Svpbmt/Svinval subextension has no execution implementation".into())}
-    let (image, mem) = load_program(program,o)?;
+
+    let (image, mem) = match open_program(program, o, &mut t) {
+        Ok(v) => v,
+        Err(()) => return platform_failed(o, &mut t, &stamp, &[]),
+    };
+    t.raw(&logx::program(program, &image));
+    // Parameter validation runs while the platform is built, before the
+    // signature model describes itself: an out-of-range value is reported and
+    // the model stays armed with it, but the accumulated error fails the build
+    // afterwards (`OP_FIP`). An override that matched nothing does not stop
+    // the model from being configured first, so its `CF_UE` lands after the
+    // signature block.
+    let byte_count_low = o.byte_count.filter(|v| *v < 16);
+    if let Some(v) = byte_count_low {
+        t.msg('E', "OP_ULT", &format!("Parameter riscvOVPsim/cpu/sigdump/ByteCount Uns32 value {v}(0x{v:x}) is less than minimum value 16(0x10)"));
+    }
     if image.xlen!=config.xlen{return Err(format!("ELF{} does not match RV{} variant",image.xlen,config.xlen))}
     let tohost = symbol(&image, "tohost");
     let entry = o.entry_address.unwrap_or_else(||if o.objects.iter().any(|(_,entry)|*entry){image.entry}else{symbol(&image, "rvtest_entry_point").unwrap_or(image.entry)});
 
-    let mut warnings = Vec::new();
+    // The signature-dump model resolves its range while the platform is built,
+    // so its `SIGNATURE_DUMP_*` block lands before the first instruction. A
+    // range the model cannot arm fails the whole build (`MEM_HGM` + `OP_FIP`).
     let plan = if o.signature_dump {
-        plan_signature(&image, o, &mut warnings)
+        match plan_signature(&image, o, &mut t) {
+            Ok(p) => p,
+            Err(_) => return platform_failed(o, &mut t, &stamp, &[]),
+        }
     } else {
         None
     };
+    if !unknown_overrides.is_empty() {
+        return platform_failed(o, &mut t, &stamp, &unknown_overrides);
+    }
+    if byte_count_low.is_some() {
+        return platform_failed(o, &mut t, &stamp, &[]);
+    }
+    // exitControl's own `write_tohost` intercept announces itself while the
+    // platform is built, before the first instruction runs. It is only
+    // installed when the platform's semihost layer does not already own
+    // `write_tohost`, i.e. when `defaultsemihost` is off.
+    if o.finish_on_writetohost && !config.default_semihost {
+        t.msg('I', "EXC_FW", "Intercept 'write_tohost'.");
+    }
 
     let mut m = Machine::new(mem, entry, tohost,config);
     m.halt_pc = symbol(&image, "write_tohost");
+    m.trace_stdout = o.trace;
     m.custom_control=o.custom_control;
     if o.custom_control{m.custom_exit_pc=symbol(&image,"_test_exit").map(|a|a.wrapping_add(1));if let Some(path)=&o.custom_logfile{m.logfile=Some(std::fs::File::create(path).map_err(|e|format!("cannot create customControl logfile '{path}': {e}"))?);}}
     m.finish_after = o.finish_after;
@@ -802,18 +1063,18 @@ fn run(o: &Opts) -> Result<(), String> {
     // slots, and giving both a symbol and an address is an error that leaves
     // the intercept disarmed.
     if o.stop_symbol.is_some() && o.stop_address.is_some() {
-        vmi_message('E', "EXC_NV", "Please specify one of symbol or address");
+        t.msg('E', "EXC_NV", "Please specify one of symbol or address");
     } else if let Some(name) = &o.stop_symbol {
         match symbol(&image, name) {
             Some(a) => {
-                vmi_message(
+                t.msg(
                     'I',
                     "EXC_SYM",
                     &format!("Program will stop at symbol '{name}' (0x{a:x})"),
                 );
                 m.stop_pc = Some(a);
             }
-            None => vmi_message('E', "EXC_SYMNF", &format!("Cannot find symbol '{name}'")),
+            None => t.msg('E', "EXC_SYMNF", &format!("Cannot find symbol '{name}'")),
         }
     } else if let Some(a) = o.stop_address {
         // `vmirtGetProcessorExternalCodeDomain` only maps an address covered by
@@ -823,10 +1084,10 @@ fn run(o: &Opts) -> Result<(), String> {
             .iter()
             .any(|s| s.flags & 1 != 0 && a >= s.addr && a < s.addr.wrapping_add(s.memsz));
         if in_code {
-            vmi_message('I', "EXC_ADDR", &format!("Program will stop at address 0x{a:x}"));
+            t.msg('I', "EXC_ADDR", &format!("Program will stop at address 0x{a:x}"));
             m.stop_pc = Some(a);
         } else {
-            vmi_message(
+            t.msg(
                 'E',
                 "EXC_ADDRDF",
                 &format!("Cannot find code domain for address 0x{a:x}"),
@@ -847,7 +1108,7 @@ fn run(o: &Opts) -> Result<(), String> {
             if v == 3 || v == 10 || v == 28 {
                 v
             } else {
-                vmi_message(
+                t.msg(
                     'E',
                     "EXC_EREG",
                     &format!("Ignored Result register {v}. Use 3, 10 or 28 (default)"),
@@ -864,6 +1125,7 @@ fn run(o: &Opts) -> Result<(), String> {
     m.addr_mask = if o.address_bits >= 64 {u64::MAX} else {(1u64 << o.address_bits)-1};
     if let Some(p) = &plan {
         m.watch_signature(p.start, p.bytes);
+        m.sig_min_writes = p.min_writes;
     }
     if o.cover_requested {
         let resolve = |name: &Option<String>| -> Result<Option<u64>, String> {
@@ -878,27 +1140,25 @@ fn run(o: &Opts) -> Result<(), String> {
         m.cov_hi = resolve(&o.cover_finish)?;
         m.cov_on = m.cov_lo.is_none();
         let mut coverage = cov::Cov::configured(o.cover_type.as_deref().unwrap_or("basic"),o.cover_ext.as_deref(),o.cover_instructions.as_deref(),m.config.xlen)?;
-        let mut input_log = String::new();
-        read_coverage_inputs(o, &mut coverage, &mut input_log)?;
-        warnings.extend(input_log.lines().map(str::to_owned));
+        if read_coverage_inputs(o, &mut coverage, &mut t).is_err() {
+            return coverage_abort(o, &mut t, &stamp);
+        }
+        // The model describes the instruction-coverage setup while the
+        // platform is built, before the window is armed.
+        t.msg(
+            'I',
+            "ICV_PVSN",
+            &format!("parameter 'user_version' is '{}'", m.config.user_version),
+        );
+        t.msg('I', "ICV_ALI", "Pseudo instructions will be translated");
+        if let Some(lo) = m.cov_lo {
+            t.msg('I', "ICV_ST", &format!("Starting coverage at 0x{lo:x}"));
+        }
         m.cov = Some(coverage);
     }
     let started = std::time::Instant::now();
     let result = m.run();
     let elapsed = started.elapsed();
-
-    // exitControl's `write_tohost` callback announces itself, but only when the
-    // model has a reason to be installed at all: a plain run ends on `tohost`
-    // because the CPU model does, and its transcripts carry no `Intercept`
-    // line (see every example in `riscv-ovpsim/README.md`).
-    let control = o.stop_symbol.is_some()
-        || o.stop_address.is_some()
-        || o.finish_on_terminate
-        || o.finish_on_opcode.is_some()
-        || o.ecall_result_reg.is_some();
-    if control && m.exit == Exit::Halt {
-        vmi_message('I', "EXC_FW", "Intercept 'write_tohost'.");
-    }
 
     if let (Ok(path), Some(h)) = (std::env::var("RUSTISS_PCDUMP"), m.hist.as_ref()) {
         let mut body = String::new();
@@ -921,112 +1181,115 @@ fn run(o: &Opts) -> Result<(), String> {
         }
     }
 
-    let mut log = String::new();
-    let _ = writeln!(
-        log,
-        "riscvOVPsim (Rust ISS {}): simulation",
-        env!("CARGO_PKG_VERSION")
-    );
-    let _ = writeln!(log, "variant           : {variant}");
-    let _ = writeln!(log, "program           : {program}");
-    let _ = writeln!(log, "entry             : 0x{:08x}", entry);
-    if let Some(t) = tohost {
-        let _ = writeln!(log, "tohost            : 0x{t:08x}");
-    }
-    if o.cover_requested {
-        let _ = writeln!(
-            log,
-            "coverage          : --cover {} --outputfile {} --reportfile {}",
-            o.cover_type.as_deref().unwrap_or("?"),
-            o.cover_file.as_deref().unwrap_or("-"),
-            o.cover_report.as_deref().unwrap_or("-")
-        );
-    }
-    for spec in &o.ignored_overrides {let _=writeln!(log,"CPU override      : {spec}");}
-    for w in &warnings {
-        let _ = writeln!(log, "signdump warning  :{w}");
-    }
-    match &result {
-        Ok(()) => {
-            let how = match m.exit {
-                Exit::Halt => "halt (call to write_tohost)".to_string(),
-                Exit::Stop(reason) => format!("stop ({reason})"),
-                Exit::Terminate => "stop (terminate symbol)".to_string(),
-                Exit::Ecall => "stop (ecall result register)".to_string(),
-                Exit::Running => "halt".to_string(),
-            };
-            let _ = writeln!(log, "exit              : {how}");
-        }
-        Err(e) => {
-            let _ = writeln!(log, "exit              : ERROR: {e}");
+    // ---- end of run ------------------------------------------------------
+    // The interpreter's event stream is already ordered instruction by
+    // instruction: `SFW` lines, `RISCV_IMA` warnings and raw `customControl`
+    // bytes sit at the point that produced them. `ICV_FN` closed the coverage
+    // window, so the document and the report are written from that offset and
+    // the halt lines keep their later position.
+    let mark = if m.cov_closed {
+        m.cov_mark.unwrap_or(m.events.len())
+    } else {
+        m.events.len()
+    };
+    t.bytes(&m.events[..mark]);
+    if m.cov_closed && o.cover_requested {
+        if let Some(c) = &m.cov {
+            coverage_outputs(o, c, m.cov_counted, &mut t)?;
         }
     }
-    let _ = writeln!(log, "instructions      : {}", m.counter);
-    let _ = writeln!(log, "wall time         : {:.3}s", elapsed.as_secs_f64());
+    t.bytes(&m.events[mark..]);
 
-    // The signature is generated when the simulation ends, as SignatureAtEnd
-    // documents ("at the end of simulation ... on detection of call to
-    // write_tohost()").
+    // `SignatureAtEnd` dumps from the `write_tohost` callback, so the
+    // announcement and the words only appear for a run that reached it: an
+    // exit intercept that ends the run early writes no signature at all.
     let mut sig_failed = false;
-    // `SignatureAtEnd` dumps from the `write_tohost` callback, so a run that an
-    // exit intercept ended early writes no signature at all.
-    if result.is_ok() && m.exit == Exit::Halt && o.signature_at_end {
+    if result.is_ok() && m.exit == Exit::Halt && o.signature_dump && o.signature_at_end {
+        if plan.is_none() {
+            // Without a usable range - no `SignatureFile`, or a configuration
+            // failure - the model never arms its write counter, so the check
+            // that runs at `write_tohost` sees no writes at all and fails.
+            t.msg(
+                'I',
+                "SIGNATURE_DUMP_WTH",
+                "Intercept 'write_tohost'. Generate Signature file",
+            );
+            t.msg(
+                'E',
+                "SIGNATURE_DUMP_SFW",
+                "Failed to detect expected writes to signature region",
+            );
+            sig_failed = true;
+        }
         if let Some(p) = &plan {
             let sig = emit_signature(p, &m.mem)?;
+            t.msg(
+                'I',
+                "SIGNATURE_DUMP_WTH",
+                "Intercept 'write_tohost'. Generate Signature file",
+            );
+            // The dump reaches stdout as well unless the override says
+            // otherwise; the logfile always receives it.
+            if o.sig_to_stdout {
+                t.raw(&sig);
+            }
             // The model only checks the write count when it can prove the
             // program is not a self-checking one (presence of `main`).
             sig_failed = p.min_writes > 0
                 && m.sig_writes < u64::from(p.min_writes)
                 && symbol(&image, "main").is_none();
             if sig_failed {
-                warnings.push(format!(
-                    "Signature Write flag not set, saw {} writes, expected at least {}",
-                    m.sig_writes, p.min_writes
-                ));
+                t.msg(
+                    'E',
+                    "SIGNATURE_DUMP_SFW",
+                    "Failed to detect expected writes to signature region",
+                );
             }
             if let Some(path) = &o.sig_file {
                 std::fs::write(path, &sig)
                     .map_err(|e| format!("cannot write signature file '{path}': {e}"))?;
-                let _ = writeln!(log, "signature file    : {path} ({} bytes)", sig.len());
-                if o.sig_to_stdout {
-                    print!("{sig}");
-                }
             }
         }
     }
     // sigdump's `write_tohost` callback prints its verdict *after* the dump,
     // from the failure flag its own write counting maintains.
     if m.exit == Exit::Halt && m.ecall_reg.is_some() {
-        println!(
-            "{}",
-            if sig_failed {
-                "Test FAILED"
-            } else {
-                "Test PASSED"
-            }
-        );
+        t.raw(if sig_failed { "Test FAILED\n" } else { "Test PASSED\n" });
+    }
+    // A window that never reached its finish symbol still writes its document,
+    // report and summary - after the signature dump, as `writeResults` does.
+    if !m.cov_closed && result.is_ok() && o.cover_requested {
+        if let Some(c) = &m.cov {
+            coverage_outputs(o, c, m.cov_counted, &mut t)?;
+        }
     }
 
-    if !warnings.is_empty() {
-        for w in &warnings {
-            let _ = writeln!(log, "warning           :{w}");
-        }
-    }
-    // `writeResults` (0x159e80) only publishes once the run has completed, and
-    // `Instructions counted` is what the counters saw inside the window.
-    let coverage = if result.is_ok() && o.cover_requested {
-        match &m.cov {
-            Some(c) => Some(coverage_outputs(o, c, m.cov_counted, &mut log)),
-            None => None,
-        }
-    } else {
-        None
-    };
-    if let Some(path) = &o.logfile {
-        std::fs::write(path, &log).map_err(|e| format!("cannot write logfile '{path}': {e}"))?;
-    }
-    if let Some(outcome) = coverage {
-        outcome?;
+    // Statistics. The `Info ` separator belongs to a run that ended on its own
+    // `write_tohost`; an intercept that stopped the processor prints none.
+    let (user, system) = logx::cpu_times();
+    let final_pc = m
+        .final_pc
+        .unwrap_or_else(|| m.pc.wrapping_add(u64::from(m.cur_len)));
+    t.raw(&logx::cpu_stats(
+        variant,
+        final_pc,
+        m.counter,
+        m.config.mips as u64,
+    ));
+    t.raw(&logx::time_stats(
+        m.counter,
+        m.config.mips as u64,
+        user,
+        system,
+        elapsed.as_secs_f64(),
+    ));
+    t.raw(&logx::shutdown(&stamp));
+    t.publish(o, &stamp)?;
+    // The model's own error counter is what makes the process exit non-zero:
+    // a signature that missed `SignatureMinWrites`, or an `ecall` the semihost
+    // layer rejected.
+    if sig_failed || m.exit == Exit::Syscall {
+        return Err(String::new());
     }
     result
 }
@@ -1041,8 +1304,12 @@ fn main() -> ExitCode {
     };
     match run(&opts) {
         Ok(()) => ExitCode::SUCCESS,
+        // Errors that the platform already reported in the transcript carry an
+        // empty message: the exit status is the only thing left to say.
         Err(e) => {
-            eprintln!("riscvOVPsim: error: {e}");
+            if !e.is_empty() {
+                eprintln!("riscvOVPsim: error: {e}");
+            }
             ExitCode::FAILURE
         }
     }

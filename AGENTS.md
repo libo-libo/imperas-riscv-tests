@@ -364,6 +364,11 @@ a scratch directory and are used only to produce the parity numbers quoted here.
 - The Rust ISS's diagnostic switches: `RUSTISS_TRACE=<file>` writes one `<pc:08x>` line per
   executed instruction, `RUSTISS_PCDUMP=<file>` writes per-PC disassembly plus coverage hits,
   `RUSTISS_COVDUMP=<file>` writes the covering tree in text-report shape.
+- `RUSTISS_ITRACE=<file>` (or `--trace` for stdout) writes a full instruction trace: one line per
+  *executed* instruction, `pc<TAB>word<TAB>privilege<TAB>disassembly<TAB>xN:old:new,...` with `-`
+  when no GPR changed and every hex value zero padded to XLEN digits. The instruction at the halt
+  symbol is not executed, so it is absent — matching an OVP stop-on-entry. This is what
+  `riscv-dv/scripts/rustiss_log_to_trace_csv.py` consumes; `--trace` used to be a no-op.
 
 Measured original versus Rust, all 48 `rv32i_m/I` tests:
 
@@ -374,16 +379,65 @@ Measured original versus Rust, all 48 `rv32i_m/I` tests:
 |`Simulated instructions` vs the Rust log line|48/48 identical|
 |per-test coverage YAML|48/48 byte-identical|
 |merged `basic.coverage.txt`|byte-identical to the reference artifact|
+|`--logfile` transcript|48/48 identical once the host-time lines are normalized|
+|stdout|48/48 identical under the same normalization|
 
-Not compared: the `--logfile` transcript itself, which carries a start timestamp and a
-host-dependent program/environment banner; two rules were derived from this differential rather
-than from disassembly:
+The transcript comparison normalizes only what cannot be reproduced: `Info Session
+started/ended: <date>`, `riscvOVPsim started/finished: <date>`, the three `User/System/Elapsed
+time` figures, the `--logfile` path echo, and the simulator path in the banner. Everything else is
+byte-identical - the 180-row `ENVIRONMENT` table, every code-tagged message, the `Info `
+separators, and the coverage frame. Two rules were derived from this differential rather than from
+disassembly:
 
 - The run ends on **entry** to `write_tohost` (its callback drives `SignatureAtEnd`), so the
   function body never executes. The halted instruction is still counted, traced, and attributed to
   coverage: the `auipc` there scores its `rd/gpr/t0` point, and its sign leaf uses the value that
   `auipc` *would* have written, not the register's previous contents.
 - The finish-symbol instruction is inside the coverage window.
+
+### The `--logfile` transcript
+
+The transcript is buffered and written once, at session end, so a killed run leaves no file. Its
+rules below are all measured against the original on the same ELF and the same argument order:
+
+- **Session frame.** `Info Session started: <date>` first, `Info Session ended: <date>` last, with
+  the `Info -------- ENVIRONMENT` / `FLAGS (from command line)` / banner sections between them.
+  The flag echo prints one line per flag, in command-line order, including the silent ones.
+- **`Info ` separator.** The three-column statistics block is preceded by a line that is exactly
+  `Info ` including its trailing space, whether or not anything was printed before it.
+- **Program block.** `OR_OF`/`OR_PH`/`OR_PD` list the ELF headers as `LOAD <offset> <vaddr>
+  <paddr> <filesz> <memsz> <flags> <align>`. A program that cannot be opened is reported as
+  `OR_FNF` (not found), `OR_FOF` + `OR_INV` (open failure, then format rejection) or `OR_INV`
+  alone (parse failure), and the run then ends with `OP_FIP` and **no** statistics block.
+- **Signature block.** `FSB`/`FSE` announce only the symbols actually consulted (`StartAddress` and
+  `EndAddress` suppress theirs), then `EN`/`ES`/`SB`/`SE`. A bad range prints `CF` plus `SNF`,
+  `ENF`, `SZ`, or the `SBB` "reducing signature size A to B" warning, whose size arithmetic is
+  the model's literal `(n + 1 - g) & ~g`. Nothing at all is printed when no `SignatureFile` is
+  configured - but a run that then reaches `write_tohost` still prints `WTH` and the
+  `SIGNATURE_DUMP_SFW` error "Failed to detect expected writes to signature region" and exits 1,
+  because the range was never armed. `ByteCount` is the only accepted spelling (`BytesCount` is an
+  unknown override, `CF_UE`), and a value below 16 prints `OP_ULT` and fails the build.
+- **Write counting.** Every store into the range prints
+  `SIGNATURE_DUMP_SFW Signature Write <n> 0x<addr> bytes <len> 0x<value>` while `n` is at or below
+  `SignatureMinWrites` (default 0, so one line per suite test); a run whose count stays under the
+  requested minimum ends with the error above and exit status 1.
+- **Build-order errors.** Every failure raised while the platform is built (`CF_UE`, `OP_ULT`,
+  `MEM_HGM`) is reported **after** the signature block and then closed with `OP_FIP`.
+- **`--nosimulation`.** The tail order is the program block, then `ICV_PVSN`/`ICV_ALI` (only when
+  `--cover` was requested), then `OP_NOS`, then the shutdown line - with no statistics block.
+- **`final_pc`.** A run halted on `write_tohost` reports the instruction's own address plus its
+  length; a semihost `ecall` that ends the run reports the ecall address plus 4.
+
+### `ecall` priority and its error path
+
+The ecall dispatch order is `--ecallresultreg` > `defaultsemihost` (default on, hands the call to
+the semihost library) > `simulateexceptions` (trap or the `--argv`/`--envp` handler) > the
+privileged trap. `simulateexceptions=T` alone therefore does **not** trap an ecall; the documented
+combination for a trapping model is `simulateexceptions=T` plus `defaultsemihost=F`. An ecall the
+library does not implement prints
+`Error (RISCV/PK) SYSCALL(unhandled(nr=<signed>))`, ends the run at the next instruction, and exits
+1 - which is why a plain `--signaturedump` run of a suite test reports
+`Final program counter : 0x80001038` and 1,018 instructions instead of halting on `write_tohost`.
 
 ### Control options (the `exitControl` intercept model)
 
@@ -418,10 +472,15 @@ here, not REA/Ghidra addresses). Callbacks: `exit_status` @`0x141e0`, `terminate
   (default)` (`EXC_EREG`) and falls back to 28; a value outside that window falls back silently.
 - `exit_status` prints `Test PASSED` when its argument is non-zero, so a result register holding
   exactly `1` is a pass and anything else is a failure.
-- `write_tohost` ends the run regardless of `--finishonwritetohost`; when any control option is
-  given the model announces itself with `Intercept 'write_tohost'.` (`EXC_FW`) /
-  `Intercept 'terminate'.` (`EXC_FT`). An intercept that ends the run early also suppresses the
-  signature dump, because `SignatureAtEnd` dumps from the `write_tohost` callback.
+- `write_tohost` ends the run regardless of `--finishonwritetohost`; an intercept that ends the
+  run early also suppresses the signature dump, because `SignatureAtEnd` dumps from the
+  `write_tohost` callback. The announce line `Intercept 'write_tohost'.` (`EXC_FW`) is **not**
+  emitted for a control option on its own: measured on `ADD-01`, `--finishonwritetohost` prints
+  it only together with `--override riscvOVPsim/cpu/defaultsemihost=F` (the platform's semihost
+  layer otherwise owns `write_tohost`), and `--finishonsymbol`/`--finishonaddress`/
+  `--finishonopcode`/`--ecallresultreg` never print it. `--finishonterminate` with the semihost
+  layer off is pathological (nothing terminates: `EXC_FW` repeats every tick, 3.3 M lines in
+  16 s) and is not modelled.
 
 ### `--showvariants`
 
@@ -677,6 +736,9 @@ second entry point into the same interpreter, not a library of the CLI binary.
   simulator's RAM array; it is `None` on the CLI path.
 - `config()` clears the `S`/`U` bits of `misa` for this target: the DUT reports `0x40001104`, and
   firmware compares `misa` against that constant, so any extra letter desynchronises the run.
+- The same `config()` sets `default_semihost=false` **and** `simulate_exceptions=true`, because
+  the CLI's ecall order consults `defaultsemihost` first: leaving it on would route `ecall` to the
+  semihost library instead of the trap the DUT raises.
 - The SV wrapper in core-v-verif requires `decode_string` to be
   `"<insn> <key>:<val> ... "` (four key/value pairs) because it `$sscanf`s five `%s` tokens;
   `ecall`/`ebreak` are the tolerated bare forms.
